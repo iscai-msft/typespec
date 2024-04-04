@@ -1,5 +1,9 @@
 # Change Log - typespec-vscode
 
+## 0.56.0
+
+No changes, version bump only.
+
 ## 0.55.0
 
 ### Bump dependencies

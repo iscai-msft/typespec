@@ -1,5 +1,9 @@
 # Change Log - @typespec/playground
 
+## 0.2.2
+
+No changes, version bump only.
+
 ## 0.2.1
 
 ### Bug Fixes

@@ -1,5 +1,12 @@
 # Change Log - @typespec/eslint-config-typespec
 
+## 0.56.0
+
+### Bug Fixes
+
+- [#3100](https://github.com/microsoft/typespec/pull/3100) Remove dependency on `eslint-plugin-prettier` which wasn't used and it a bad pattern to use prettier
+
+
 ## 0.55.0
 
 ### Bug Fixes

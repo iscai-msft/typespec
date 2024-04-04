@@ -2,6 +2,10 @@
 
 ## 0.5.4
 
+No changes, version bump only.
+
+## 0.5.4
+
 ### Bump dependencies
 
 - [#3027](https://github.com/microsoft/typespec/pull/3027) Update dependencies
