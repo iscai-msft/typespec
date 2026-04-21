@@ -375,6 +375,18 @@ stages:
                       inlineScript: node ./eng/emitters/scripts/upload-bundled-emitter.js ${{ parameters.PackagePath }}
                       workingDirectory: $(Build.SourcesDirectory)
 
+              # Notify downstream repos of the new release
+              - ${{ if eq(parameters.LanguageShortName, 'python') }}:
+                  - template: /eng/common/pipelines/templates/steps/login-to-github.yml
+                  - script: |
+                      curl -f -X POST \
+                        -H "Accept: application/vnd.github+json" \
+                        -H "Authorization: Bearer $(GH_TOKEN)" \
+                        https://api.github.com/repos/Azure/azure-sdk-for-python/dispatches \
+                        -d '{"event_type":"typespec-python-regenerate","client_payload":{"sha":"$(Build.SourceVersion)"}}'
+                    displayName: Trigger azure-sdk-for-python regeneration
+                    condition: succeeded()
+
             templateContext:
               outputs:
                 - output: pipelineArtifact
