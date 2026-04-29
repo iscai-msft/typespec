@@ -37,6 +37,10 @@ export function deepClone<T>(value: T): T {
     return value.map(deepClone) as any;
   }
 
+  if (value === null) {
+    return value;
+  }
+
   if (typeof value === "object") {
     const obj: any = {};
     for (const prop in value) {
@@ -443,23 +447,23 @@ class RekeyableMapImpl<K, V> implements RekeyableMap<K, V> {
     return this.#values.size;
   }
 
-  *entries(): IterableIterator<[K, V]> {
+  *entries(): MapIterator<[K, V]> {
     for (const [k, v] of this.#values) {
       yield [k.key, v];
     }
   }
 
-  *keys(): IterableIterator<K> {
+  *keys(): MapIterator<K> {
     for (const k of this.#values.keys()) {
       yield k.key;
     }
   }
 
-  values(): IterableIterator<V> {
+  values(): MapIterator<V> {
     return this.#values.values();
   }
 
-  [Symbol.iterator](): IterableIterator<[K, V]> {
+  [Symbol.iterator](): MapIterator<[K, V]> {
     return this.entries();
   }
 
@@ -479,4 +483,19 @@ class RekeyableMapImpl<K, V> implements RekeyableMap<K, V> {
     this.#keys.set(newKey, keyItem);
     return true;
   }
+}
+
+export function isPromise(value: unknown): value is Promise<unknown> {
+  return !!value && typeof (value as any).then === "function";
+}
+
+export function getEnvironmentVariable(
+  envVarName: string,
+  defaultWhenNotAvailable?: string,
+): string | undefined {
+  // make sure we are fine in both node and browser environments
+  if (typeof process !== "undefined") {
+    return process?.env?.[envVarName] ?? defaultWhenNotAvailable;
+  }
+  return defaultWhenNotAvailable;
 }

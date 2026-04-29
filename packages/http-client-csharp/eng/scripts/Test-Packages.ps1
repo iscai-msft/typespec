@@ -32,7 +32,17 @@ try {
     }
     if ($GenerationChecks) {
         Set-StrictMode -Version 1
-        Invoke-LoggedCommand "npm run build" -GroupOutput
+
+        Write-Host "Installing pnpm" -ForegroundColor Cyan
+        Invoke-LoggedCommand "npm install -g pnpm" -GroupOutput
+
+        Write-Host "Setting up workspace" -ForegroundColor Cyan
+        Invoke-LoggedCommand "pnpm setup:min" $packageRoot/../..
+
+        Write-Host "Regenerating extern signatures" -ForegroundColor Cyan
+        Invoke-LoggedCommand "npm run gen-extern-signature" -GroupOutput
+
+        Invoke-LoggedCommand "npm run build && npm run regen-docs" -GroupOutput
         # run E2E Test for TypeSpec emitter
         Write-Host "Generating test projects ..."
         & "$packageRoot/eng/scripts/Generate.ps1"

@@ -5,6 +5,7 @@ import {
   CodeActionParams,
   CompletionList,
   CompletionParams,
+  CreateFile,
   DefinitionParams,
   DiagnosticSeverity,
   DiagnosticTag,
@@ -16,6 +17,7 @@ import {
   DocumentSymbol,
   DocumentSymbolParams,
   ExecuteCommandParams,
+  FileChangeType,
   FoldingRange,
   FoldingRangeParams,
   Hover,
@@ -30,6 +32,7 @@ import {
   PrepareRenameParams,
   Range,
   ReferenceParams,
+  RenameFilesParams,
   RenameParams,
   SemanticTokens,
   SemanticTokensBuilder,
@@ -39,6 +42,7 @@ import {
   SignatureHelp,
   SignatureHelpParams,
   TextDocumentChangeEvent,
+  TextDocumentEdit,
   TextDocumentIdentifier,
   TextDocumentSyncKind,
   TextEdit,
@@ -46,6 +50,7 @@ import {
   WorkspaceEdit,
   WorkspaceFoldersChangeEvent,
 } from "vscode-languageserver/node.js";
+import { getSymNode } from "../core/binder.js";
 import { CharCode } from "../core/charcode.js";
 import { resolveCodeFix } from "../core/code-fixes.js";
 import { compilerAssert, getSourceLocation } from "../core/diagnostics.js";
@@ -55,6 +60,7 @@ import { builtInLinterRule_UnusedTemplateParameter } from "../core/linter-rules/
 import { builtInLinterRule_UnusedUsing } from "../core/linter-rules/unused-using.rule.js";
 import { builtInLinterLibraryName } from "../core/linter.js";
 import { formatLog } from "../core/logger/index.js";
+import { CompilerOptions } from "../core/options.js";
 import { getPositionBeforeTrivia } from "../core/parser-utils.js";
 import { getNodeAtPosition, getNodeAtPositionDetail, visitChildren } from "../core/parser.js";
 import {
@@ -62,8 +68,9 @@ import {
   getDirectoryPath,
   joinPaths,
   normalizePath,
+  resolvePath,
 } from "../core/path-utils.js";
-import type { Program } from "../core/program.js";
+import { type Program } from "../core/program.js";
 import { skipTrivia, skipWhiteSpace } from "../core/scanner.js";
 import { createSourceFile, getSourceFileKindFromExt } from "../core/source-file.js";
 import {
@@ -90,9 +97,11 @@ import { validateTemplateDefinitions } from "../init/init-template-validate.js";
 import { InitTemplate } from "../init/init-template.js";
 import { scaffoldNewProject } from "../init/scaffold.js";
 import { typespecVersion } from "../manifest.js";
-import { resolveModule, ResolveModuleHost } from "../module-resolver/module-resolver.js";
+import { resolveModule, ResolveModuleHost } from "../module-resolver/index.js";
+import { listAllFilesInDir } from "../utils/fs-utils.js";
 import { getNormalizedRealPath, resolveTspMain } from "../utils/misc.js";
 import { getSemanticTokens } from "./classify.js";
+import { ClientConfigProvider } from "./client-config-provider.js";
 import { createCompileService } from "./compile-service.js";
 import { resolveCompletion } from "./completion.js";
 import { Commands } from "./constants.js";
@@ -101,6 +110,8 @@ import { createFileService } from "./file-service.js";
 import { createFileSystemCache } from "./file-system-cache.js";
 import { LibraryProvider } from "./lib-provider.js";
 import { NpmPackageProvider } from "./npm-package-provider.js";
+import { getRenameImportEdit, getUpdatedImportValue } from "./rename-file.js";
+import { ServerCompileOptions } from "./server-compile-manager.js";
 import { getSymbolStructure } from "./symbol-structure.js";
 import { provideTspconfigCompletionItems } from "./tspconfig/completion.js";
 import {
@@ -112,17 +123,23 @@ import {
   CompileResult,
   InitProjectConfig,
   InitProjectContext,
+  InternalCompileResult,
   SemanticTokenKind,
   Server,
   ServerCustomCapacities,
+  ServerDiagnostic,
   ServerHost,
   ServerInitializeResult,
   ServerLog,
   ServerSourceFile,
   ServerWorkspaceFolder,
 } from "./types.js";
+import { UpdateManager } from "./update-manager.js";
 
-export function createServer(host: ServerHost): Server {
+export function createServer(
+  host: ServerHost,
+  clientConfigsProvider?: ClientConfigProvider,
+): Server {
   const fileService = createFileService({ serverHost: host });
 
   // Cache all file I/O. Only open documents are sent over the LSP pipe. When
@@ -144,16 +161,24 @@ export function createServer(host: ServerHost): Server {
     (exports) => exports.$linter !== undefined,
   );
 
+  const updateManager = new UpdateManager("doc-update", log);
+  const signatureHelpUpdateManager = new UpdateManager<CompileResult | undefined>(
+    "signature-help",
+    log,
+    host.getDocumentUpdateDebounceDelay,
+  );
+
   const compileService = createCompileService({
     fileService,
     fileSystemCache,
     compilerHost,
     serverHost: host,
+    updateManager,
     log,
+    clientConfigsProvider,
   });
   const currentDiagnosticIndex = new Map<number, Diagnostic>();
   let diagnosticIdCounter = 0;
-  compileService.on("compileEnd", (result) => reportDiagnostics(result));
 
   let workspaceFolders: ServerWorkspaceFolder[] = [];
   let isInitialized = false;
@@ -166,7 +191,7 @@ export function createServer(host: ServerHost): Server {
     get workspaceFolders() {
       return workspaceFolders;
     },
-    compile: compileService.compile,
+    compile,
     initialize,
     initialized,
     workspaceFoldersChanged,
@@ -174,11 +199,13 @@ export function createServer(host: ServerHost): Server {
     formatDocument,
     gotoDefinition,
     documentClosed,
+    documentOpened,
     complete,
     findReferences,
     findDocumentHighlight,
     prepareRename,
     rename,
+    renameFiles,
     getSemanticTokens: getSemanticTokensForDocument,
     buildSemanticTokens,
     checkChange,
@@ -189,10 +216,12 @@ export function createServer(host: ServerHost): Server {
     getCodeActions,
     executeCommand,
     log,
+    reportDiagnostics,
 
     getInitProjectContext,
     validateInitProjectTemplate,
     initProject,
+    internalCompile,
   };
 
   async function initialize(params: InitializeParams): Promise<InitializeResult> {
@@ -203,6 +232,31 @@ export function createServer(host: ServerHost): Server {
       tokenModifiers: [],
     };
 
+    updateManager.setCallback(async (updates) => {
+      if (updates.length === 0) {
+        return;
+      }
+      // we only need to compile the last update, the previous update will be overwritten by the last one anyway
+      const lastUpdate = updates.reduce((pre, cur) => {
+        return cur.latestUpdateTimestamp > pre.latestUpdateTimestamp ? cur : pre;
+      });
+      const curVersion = updateManager.docChangedVersion;
+      const result = await compileService.compile(lastUpdate.latest, undefined, {
+        mode: "full",
+        // the callback should be or have been triggered for the new version, so this one should be
+        // cancelled in this case
+        isCancelled: () => updateManager.docChangedVersion > curVersion,
+      });
+      if (result && curVersion === updateManager.docChangedVersion) {
+        await reportDiagnostics(result);
+      }
+    });
+
+    signatureHelpUpdateManager.setCallback(async (_updates, triggeredBy) => {
+      // for signature help, we should always compile against the document that triggered the request and core mode is enough for us
+      // debounce can help to avoid the unnecessary triggering and compiler cache should be able to avoid the duplicates compile
+      return await compileInCoreMode(triggeredBy);
+    });
     const capabilities: ServerCapabilities = {
       textDocumentSync: TextDocumentSyncKind.Incremental,
       definitionProvider: true,
@@ -247,6 +301,20 @@ export function createServer(host: ServerHost): Server {
           supported: true,
           changeNotifications: true,
         },
+        fileOperations: {
+          didRename: {
+            filters: [
+              {
+                scheme: "file",
+                pattern: { glob: "**/*.tsp", matches: "file" },
+              },
+              {
+                scheme: "file",
+                pattern: { glob: "**/*", matches: "folder" },
+              },
+            ],
+          },
+        },
       };
       // eslint-disable-next-line @typescript-eslint/no-deprecated
     } else if (params.rootUri) {
@@ -281,13 +349,14 @@ export function createServer(host: ServerHost): Server {
       getInitProjectContext: true,
       initProject: true,
       validateInitProjectTemplate: true,
+      internalCompile: true,
     };
     // the file path is expected to be .../@typespec/compiler/dist/src/server/serverlib.js
     const curFile = normalizePath(compilerHost.fileURLToPath(import.meta.url));
     const SERVERLIB_PATH_ENDWITH = "/dist/src/server/serverlib.js";
     let compilerRootFolder = undefined;
     if (!curFile.endsWith(SERVERLIB_PATH_ENDWITH)) {
-      log({ level: "warning", message: `Unexpected path for serverlib found: ${curFile}` });
+      // Ignore this could be the playground or standalone cli
     } else {
       compilerRootFolder = curFile.slice(0, curFile.length - SERVERLIB_PATH_ENDWITH.length);
     }
@@ -307,6 +376,8 @@ export function createServer(host: ServerHost): Server {
   }
 
   function initialized(params: InitializedParams): void {
+    updateManager.start();
+    signatureHelpUpdateManager.start();
     isInitialized = true;
     log({ level: "info", message: "Initialization complete." });
   }
@@ -315,6 +386,20 @@ export function createServer(host: ServerHost): Server {
     return {
       coreInitTemplates: await getTypeSpecCoreTemplates(host.compilerHost),
     };
+  }
+
+  async function compile(
+    document: TextDocument | TextDocumentIdentifier,
+    additionalOptions: CompilerOptions | undefined,
+    serverCompileOptions: ServerCompileOptions,
+  ): Promise<CompileResult | undefined> {
+    return compileService.compile(document, additionalOptions, serverCompileOptions);
+  }
+
+  async function compileInCoreMode(
+    document: TextDocument | TextDocumentIdentifier,
+  ): Promise<CompileResult | undefined> {
+    return compile(document, undefined, { mode: "core" });
   }
 
   async function validateInitProjectTemplate(param: { template: InitTemplate }): Promise<boolean> {
@@ -344,6 +429,144 @@ export function createServer(host: ServerHost): Server {
     } catch (e) {
       log({ level: "error", message: "Unexpected error when initializing project", detail: e });
       return false;
+    }
+  }
+
+  async function internalCompile(param: {
+    doc: TextDocumentIdentifier;
+    options: CompilerOptions;
+  }): Promise<InternalCompileResult> {
+    const option: CompilerOptions = {
+      ...param.options,
+    };
+
+    const result = await compileService.compile(param.doc, option, {
+      skipCache: true,
+      skipOldProgramFromCache: true,
+      mode: "full",
+    });
+    if (result === undefined) {
+      return {
+        hasError: true,
+        diagnostics: [
+          {
+            code: "internal-error",
+            message:
+              "Failed to get compiler result, please check the compilation output for details",
+            severity: "error",
+            target: NoTarget,
+            url: undefined,
+          },
+        ],
+        entrypoint: undefined,
+        options: undefined,
+      };
+    } else {
+      result.tracker.getLogs().forEach((logItem) => host.log(logItem));
+      return {
+        hasError: result.program.hasError(),
+        diagnostics: result.program.diagnostics.map((diagnostic) => {
+          const target = getSourceLocation(diagnostic.target, { locateId: true });
+          let position = undefined;
+          if (target?.file) {
+            const lineAndCharacter = target.file.getLineAndCharacterOfPosition(target.pos);
+            position = {
+              line: lineAndCharacter.line + 1,
+              column: lineAndCharacter.character + 1,
+            };
+          }
+          return {
+            code: diagnostic.code,
+            message: diagnostic.message,
+            severity: diagnostic.severity,
+            target: { ...target, position: position },
+            url: diagnostic.url,
+          } as ServerDiagnostic;
+        }),
+        entrypoint: result.document?.uri,
+        options: result.program.compilerOptions,
+      };
+    }
+  }
+
+  async function renameFiles(params: RenameFilesParams): Promise<void> {
+    const firstFilePath = params.files[0];
+    if (!firstFilePath) {
+      return;
+    }
+
+    // Update cache for renamed folders.
+    for (const file of params.files) {
+      const oldFilePath = await fileService.getPath({ uri: file.oldUri });
+      const newFilePath = await fileService.getPath({ uri: file.newUri });
+      const isDirRename = !file.oldUri.endsWith(".tsp");
+
+      if (isDirRename) {
+        const files = await listAllFilesInDir(compilerHost, newFilePath);
+        for (const file of files) {
+          const oldFile = resolvePath(oldFilePath, file);
+
+          fileSystemCache.notify([
+            { uri: fileService.getURL(oldFile), type: FileChangeType.Deleted },
+          ]);
+        }
+      }
+    }
+
+    const mainFile = await compileService.getMainFileForDocument(
+      await fileService.getPath({ uri: firstFilePath.newUri }),
+    );
+
+    if (mainFile === undefined) {
+      log({ level: "debug", message: `failed to resolve main file for ${firstFilePath.newUri}` });
+      return;
+    }
+
+    // Add this method to resolve timing issues between renamed files and `fs.stat`
+    // to prevent `fs.stat` from getting the files before modification.
+    // Currently the test requires a delay of 300ms
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    // There will be no event triggered if the renamed file is not opened in vscode, also even when it's opened
+    // there will be only closed and opened event triggered for the old and new file url, so send fire the update
+    // explicitly here to make sure the change is not missed.
+    void updateManager.scheduleUpdate({ uri: fileService.getURL(mainFile) }, "renamed");
+
+    const result = await compileInCoreMode({ uri: fileService.getURL(mainFile) });
+    if (!result) {
+      log({
+        level: "debug",
+        message: `The main tsp file '${mainFile}' compilation failed, please check the detailed compilation message`,
+      });
+      return;
+    }
+
+    for (const file of params.files) {
+      const oldFilePath = await fileService.getPath({ uri: file.oldUri });
+      const newFilePath = await fileService.getPath({ uri: file.newUri });
+      const isDirRename = !file.oldUri.endsWith(".tsp");
+
+      for (const diagnostic of result.program.diagnostics) {
+        if (diagnostic.code !== "import-not-found") continue;
+        const target = diagnostic.target as Node;
+        if (target.kind === SyntaxKind.ImportStatement) {
+          const result = getUpdatedImportValue(target, {
+            oldPath: oldFilePath,
+            newPath: newFilePath,
+            isDirRename,
+          });
+
+          if (result) {
+            log({
+              level: "info",
+              message: `The imports content '${target.path.value}' needs to be modified in tsp file '${result.filePath}' to '${result.newValue}'`,
+            });
+
+            const edit = getRenameImportEdit(target, result.newValue);
+            await host.applyEdit({ changes: { [fileService.getURL(result.filePath)]: [edit] } });
+          }
+        }
+      }
     }
   }
 
@@ -446,11 +669,15 @@ export function createServer(host: ServerHost): Server {
   ): Promise<DocumentHighlight[]> {
     if (isTspConfigFile(params.textDocument)) return [];
 
-    const result = await compileService.compile(params.textDocument);
+    const result = await compileInCoreMode(params.textDocument);
     if (result === undefined) {
       return [];
     }
     const { program, document, script } = result;
+    if (!document || !script) {
+      return [];
+    }
+
     const identifiers = findReferenceIdentifiers(
       program,
       script,
@@ -463,12 +690,30 @@ export function createServer(host: ServerHost): Server {
     }));
   }
 
-  async function checkChange(change: TextDocumentChangeEvent<TextDocument>) {
-    if (isTspConfigFile(change.document)) return undefined;
-
-    compileService.notifyChange(change.document);
+  function checkChange(change: TextDocumentChangeEvent<TextDocument>) {
+    const initVersion = fileService.getOpenDocumentInitVersion(change.document.uri);
+    if (!initVersion) {
+      // not expected, log something for troubleshooting
+      log({
+        level: "debug",
+        message: "Document change received for document not in documentsOpened set",
+        detail: change.document.uri,
+      });
+      documentOpened(change);
+    } else if (initVersion < change.document.version) {
+      compileService.notifyChange(change.document, "changed");
+    } else {
+      // do nothing for initVersion === change.document.version which should have been handled by didOpen event
+    }
   }
+
+  function documentOpened(change: TextDocumentChangeEvent<TextDocument>) {
+    fileService.notifyDocumentOpened(change);
+    compileService.notifyChange(change.document, "opened");
+  }
+
   async function reportDiagnostics({ program, document, optionsFromConfig }: CompileResult) {
+    if (!document) return undefined;
     if (isTspConfigFile(document)) return undefined;
 
     currentDiagnosticIndex.clear();
@@ -481,9 +726,18 @@ export function createServer(host: ServerHost): Server {
     const diagnosticMap: Map<TextDocument, VSDiagnostic[]> = new Map();
     diagnosticMap.set(document, []);
     for (const each of program.sourceFiles.values()) {
-      const document = (each.file as ServerSourceFile)?.document;
-      if (document) {
-        diagnosticMap.set(document, []);
+      const saved = (each.file as ServerSourceFile)?.document;
+      if (saved) {
+        diagnosticMap.set(saved, []);
+      } else {
+        // The file may be opened later when the compile used as cache
+        // so double check the fileService for opened document. Since
+        // TextDocuments will always return the same TextDocument instance
+        // so we should be good to use the TextDocument as the key here.
+        const opened = fileService.getOpenDocument(each.file.path);
+        if (opened) {
+          diagnosticMap.set(opened, []);
+        }
       }
     }
 
@@ -525,7 +779,10 @@ export function createServer(host: ServerHost): Server {
             diagnostic.severity = DiagnosticSeverity.Hint;
           }
         }
-        diagnostic.data = { id: diagnosticIdCounter++ };
+        diagnostic.data = {
+          id: diagnosticIdCounter++,
+          file: diagDocument.uri,
+        };
         const diagnostics = diagnosticMap.get(diagDocument);
         compilerAssert(
           diagnostics,
@@ -544,33 +801,73 @@ export function createServer(host: ServerHost): Server {
   async function getHover(params: HoverParams): Promise<Hover> {
     if (isTspConfigFile(params.textDocument)) return { contents: [] };
 
-    const result = await compileService.compile(params.textDocument);
+    const result = await compileInCoreMode(params.textDocument);
     if (result === undefined) {
       return { contents: [] };
     }
     const { program, document, script } = result;
 
+    if (!document || !script) {
+      return { contents: [] };
+    }
+
     const id = getNodeAtPosition(script, document.offsetAt(params.position));
     const sym =
       id?.kind === SyntaxKind.Identifier ? program.checker.resolveRelatedSymbols(id) : undefined;
 
-    const markdown: MarkupContent = {
-      kind: MarkupKind.Markdown,
-      value: sym && sym.length > 0 ? getSymbolDetails(program, sym[0]) : "",
-    };
-    return {
-      contents: markdown,
-    };
+    if (!sym || sym.length === 0) {
+      return { contents: { kind: MarkupKind.Markdown, value: "" } };
+    } else {
+      // Only show full definition if the symbol is a model or interface that has extends or is clauses.
+      // Avoid showing full definition in other cases which can be long and not useful
+      let includeExpandedDefinition = false;
+      const sn = getSymNode(sym[0]);
+      if (sn.kind !== SyntaxKind.AliasStatement) {
+        const type = sym[0].type ?? program.checker.getTypeOrValueForNode(sn);
+        if (type && "kind" in type) {
+          const modelHasExtendOrIs: boolean =
+            type.kind === "Model" &&
+            (type.baseModel !== undefined ||
+              type.sourceModel !== undefined ||
+              type.sourceModels.length > 0);
+          const interfaceHasExtend: boolean =
+            type.kind === "Interface" && type.sourceInterfaces.length > 0;
+          includeExpandedDefinition = modelHasExtendOrIs || interfaceHasExtend;
+        }
+      }
+
+      const markdown: MarkupContent = {
+        kind: MarkupKind.Markdown,
+        value:
+          sym && sym.length > 0
+            ? await getSymbolDetails(program, sym[0], {
+                includeSignature: true,
+                includeParameterTags: true,
+                includeExpandedDefinition,
+              })
+            : "",
+      };
+      return {
+        contents: markdown,
+      };
+    }
   }
 
   async function getSignatureHelp(params: SignatureHelpParams): Promise<SignatureHelp | undefined> {
     if (isTspConfigFile(params.textDocument)) return undefined;
 
-    const result = await compileService.compile(params.textDocument);
+    const result = await signatureHelpUpdateManager.scheduleUpdate(params.textDocument, "changed");
+    log({
+      level: "debug",
+      message: `getSignatureHelp got compile result: isUndefined = ${result === undefined}`,
+    });
     if (result === undefined) {
       return undefined;
     }
     const { script, document, program } = result;
+    if (!document || !script) {
+      return undefined;
+    }
     const data = getSignatureHelpNodeAtPosition(script, document.offsetAt(params.position));
     if (data === undefined) {
       return undefined;
@@ -588,11 +885,11 @@ export function createServer(host: ServerHost): Server {
     }
   }
 
-  function getSignatureHelpForTemplate(
+  async function getSignatureHelpForTemplate(
     program: Program,
     node: TypeReferenceNode,
     argumentIndex: number,
-  ): SignatureHelp | undefined {
+  ): Promise<SignatureHelp | undefined> {
     const sym = program.checker.resolveRelatedSymbols(
       node.target.kind === SyntaxKind.MemberExpression ? node.target.id : node.target,
     );
@@ -630,7 +927,7 @@ export function createServer(host: ServerHost): Server {
       activeParameter: 0,
     };
 
-    const doc = getSymbolDetails(program, sym[0], {
+    const doc = await getSymbolDetails(program, sym[0], {
       includeSignature: false,
       includeParameterTags: false,
     });
@@ -641,11 +938,11 @@ export function createServer(host: ServerHost): Server {
     return help;
   }
 
-  function getSignatureHelpForDecorator(
+  async function getSignatureHelpForDecorator(
     program: Program,
     node: DecoratorExpressionNode | AugmentDecoratorStatementNode,
     argumentIndex: number,
-  ): SignatureHelp | undefined {
+  ): Promise<SignatureHelp | undefined> {
     const sym = program.checker.resolveRelatedSymbols(
       node.target.kind === SyntaxKind.MemberExpression ? node.target.id : node.target,
     );
@@ -708,7 +1005,7 @@ export function createServer(host: ServerHost): Server {
       activeParameter: 0,
     };
 
-    const doc = getSymbolDetails(program, sym[0], {
+    const doc = await getSymbolDetails(program, sym[0], {
       includeSignature: false,
       includeParameterTags: false,
     });
@@ -736,8 +1033,17 @@ export function createServer(host: ServerHost): Server {
       level: "info",
       message: `Formatting TypeSpec document: ${JSON.stringify({ fileUri: params.textDocument.uri, vscodeOptions: params.options, prettierConfig, resolvedConfig }, null, 2)}`,
     });
-    const formattedText = await formatTypeSpec(document.getText(), resolvedConfig);
-    return [minimalEdit(document, formattedText)];
+    try {
+      const formattedText = await formatTypeSpec(document.getText(), resolvedConfig);
+      return [minimalEdit(document, formattedText)];
+    } catch (error) {
+      log({
+        level: "error",
+        message: `Failed to format TypeSpec document: ${params.textDocument.uri}`,
+        detail: error,
+      });
+      return [];
+    }
   }
 
   async function resolvePrettierConfig(path: string) {
@@ -776,8 +1082,8 @@ export function createServer(host: ServerHost): Server {
   async function gotoDefinition(params: DefinitionParams): Promise<Location[]> {
     if (isTspConfigFile(params.textDocument)) return [];
 
-    const result = await compileService.compile(params.textDocument);
-    if (result === undefined) {
+    const result = await compileInCoreMode(params.textDocument);
+    if (result === undefined || result.document === undefined || result.script === undefined) {
       return [];
     }
     const node = getNodeAtPosition(result.script, result.document.offsetAt(params.position));
@@ -809,11 +1115,14 @@ export function createServer(host: ServerHost): Server {
     };
     const resolved = await resolveModule(host, importPath, {
       baseDir: getDirectoryPath(currentFile.file.path),
+      directoryIndexFiles: ["main.tsp", "index.mjs", "index.js"],
       resolveMain(pkg) {
         // this lets us follow node resolve semantics more-or-less exactly
         // but using tspMain instead of main.
         return resolveTspMain(pkg) ?? pkg.main;
       },
+      conditions: ["typespec"],
+      fallbackOnMissingCondition: true,
     });
     return {
       uri: fileService.getURL(resolved.type === "file" ? resolved.path : resolved.mainFile),
@@ -841,9 +1150,12 @@ export function createServer(host: ServerHost): Server {
       isIncomplete: false,
       items: [],
     };
-    const result = await compileService.compile(params.textDocument);
+    const result = await compileInCoreMode(params.textDocument);
     if (result) {
       const { script, document, program } = result;
+      if (!document || !script) {
+        return completions;
+      }
       const posDetail = getCompletionNodeAtPosition(script, document.offsetAt(params.position));
 
       return await resolveCompletion(
@@ -863,8 +1175,8 @@ export function createServer(host: ServerHost): Server {
   async function findReferences(params: ReferenceParams): Promise<Location[]> {
     if (isTspConfigFile(params.textDocument)) return [];
 
-    const result = await compileService.compile(params.textDocument);
-    if (result === undefined) {
+    const result = await compileInCoreMode(params.textDocument);
+    if (result === undefined || result.document === undefined || result.script === undefined) {
       return [];
     }
     const identifiers = findReferenceIdentifiers(
@@ -878,8 +1190,8 @@ export function createServer(host: ServerHost): Server {
   async function prepareRename(params: PrepareRenameParams): Promise<Range | undefined> {
     if (isTspConfigFile(params.textDocument)) return undefined;
 
-    const result = await compileService.compile(params.textDocument);
-    if (result === undefined) {
+    const result = await compileInCoreMode(params.textDocument);
+    if (result === undefined || result.document === undefined || result.script === undefined) {
       return undefined;
     }
     const id = getNodeAtPosition(result.script, result.document.offsetAt(params.position));
@@ -890,8 +1202,8 @@ export function createServer(host: ServerHost): Server {
     if (isTspConfigFile(params.textDocument)) return { changes: {} };
 
     const changes: Record<string, TextEdit[]> = {};
-    const result = await compileService.compile(params.textDocument);
-    if (result) {
+    const result = await compileInCoreMode(params.textDocument);
+    if (result && result.document && result.script) {
       const identifiers = findReferenceIdentifiers(
         result.program,
         result.script,
@@ -1011,21 +1323,45 @@ export function createServer(host: ServerHost): Server {
 
   async function executeCommand(params: ExecuteCommandParams) {
     if (params.command === Commands.APPLY_CODE_FIX) {
-      const [documentUri, diagId, fixId] = params.arguments ?? [];
-      if (documentUri && diagId && fixId) {
+      const [, diagId, fixId] = params.arguments ?? [];
+      if (diagId && fixId) {
         const diag = currentDiagnosticIndex.get(diagId);
         const codeFix = diag?.codefixes?.find((x) => x.id === fixId);
         if (codeFix) {
           const edits = await resolveCodeFix(codeFix);
           const vsEdits = convertCodeFixEdits(edits);
-          await host.applyEdit({ changes: { [documentUri]: vsEdits } });
+          await host.applyEdit({ documentChanges: vsEdits });
         }
       }
     }
   }
-  function convertCodeFixEdits(edits: CodeFixEdit[]): TextEdit[] {
-    return edits.map(convertCodeFixEdit);
+
+  function convertCodeFixEdits(edits: CodeFixEdit[]) {
+    // Group edits by file and convert to VS Code TextEdit
+    const editsByFile = new Map<string, TextEdit[]>();
+    for (const edit of edits) {
+      // Regardless of whether the file exists or not, a file path starting with `file:///` can be obtained.
+      const uri = fileService.getURL(edit.file.path);
+      const textEdits = editsByFile.get(uri) ?? [];
+      textEdits.push(convertCodeFixEdit(edit));
+      editsByFile.set(uri, textEdits);
+    }
+
+    // Use documentChanges to create files when needed
+    const documentChanges: Array<CreateFile | TextDocumentEdit> = [];
+    for (const [uri, vsEdits] of editsByFile) {
+      // Ignore creation if the file already exists; if it does not exist, create it first
+      documentChanges.push({ kind: "create", uri, options: { ignoreIfExists: true } });
+      const document = host.getOpenDocumentByURL(uri);
+      documentChanges.push({
+        textDocument: { uri, version: document ? document.version : null },
+        edits: vsEdits,
+      });
+    }
+
+    return documentChanges;
   }
+
   function convertCodeFixEdit(edit: CodeFixEdit): TextEdit {
     switch (edit.kind) {
       case "insert-text":
@@ -1036,6 +1372,7 @@ export function createServer(host: ServerHost): Server {
   }
 
   function documentClosed(change: TextDocumentChangeEvent<TextDocument>) {
+    fileService.notifyDocumentClosed(change);
     // clear diagnostics on file close
     sendDiagnostics(change.document, []);
   }

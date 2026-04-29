@@ -1,4 +1,12 @@
-import { AssetEmitter, EmitterOutput, StringBuilder, code } from "@typespec/asset-emitter";
+import {
+  AssetEmitter,
+  Declaration,
+  EmitterOutput,
+  Scope,
+  SourceFile,
+  StringBuilder,
+  code,
+} from "@typespec/asset-emitter";
 import {
   IntrinsicScalarName,
   IntrinsicType,
@@ -12,8 +20,10 @@ import {
   StringTemplateSpan,
   Type,
   Union,
+  Value,
   getFriendlyName,
   getMinValue,
+  isArrayModelType,
   isErrorModel,
   isNullType,
   isNumericType,
@@ -22,7 +32,9 @@ import {
   isVoidType,
   resolveCompilerOptions,
   resolvePath,
+  serializeValueAsJson,
 } from "@typespec/compiler";
+import { $ } from "@typespec/compiler/typekit";
 import {
   HttpOperation,
   HttpOperationParameter,
@@ -41,21 +53,25 @@ import {
   isStatusCode,
 } from "@typespec/http";
 import { HttpRequestParameterKind } from "@typespec/http/experimental/typekit";
+import { getUniqueItems } from "@typespec/json-schema";
 import { camelCase, pascalCase } from "change-case";
 import { createServer } from "net";
 import { getAttributes } from "./attributes.js";
 import {
   Attribute,
   BooleanValue,
+  CSharpCollectionType,
   CSharpOperationParameter,
   CSharpType,
   CSharpValue,
+  CollectionType,
   NameCasingType,
   NullValue,
   NumericValue,
   StringValue,
+  checkOrAddNamespaceToScope,
 } from "./interfaces.js";
-import { CSharpServiceEmitterOptions, reportDiagnostic } from "./lib.js";
+import { CSharpServiceEmitterOptions, CSharpServiceOptions, reportDiagnostic } from "./lib.js";
 import { getDoubleType, getEnumType } from "./type-helpers.js";
 
 const _scalars: Map<Scalar, CSharpType> = new Map<Scalar, CSharpType>();
@@ -88,9 +104,18 @@ export function getCSharpTypeForScalar(program: Program, scalar: Scalar): CSharp
 
 export const UnknownType: CSharpType = new CSharpType({
   name: "JsonNode",
-  namespace: "System.Text.Json",
+  namespace: "System.Text.Json.Nodes",
   isValueType: false,
-  isBuiltIn: true,
+  isBuiltIn: false,
+  isClass: true,
+});
+
+export const RecordType = new CSharpType({
+  name: "JsonObject",
+  namespace: "System.Text.Json.Nodes",
+  isBuiltIn: false,
+  isValueType: false,
+  isClass: true,
 });
 export function getCSharpType(
   program: Program,
@@ -140,7 +165,7 @@ export function getCSharpType(
       return {
         type: new CSharpType({
           name: ensureCSharpIdentifier(program, type, type.name, NameCasingType.Class),
-          namespace: namespace || "Models",
+          namespace: `${namespace}`,
           isBuiltIn: false,
           isValueType: false,
           isClass: true,
@@ -151,7 +176,7 @@ export function getCSharpType(
       return {
         type: new CSharpType({
           name: ensureCSharpIdentifier(program, type, type.name, NameCasingType.Class),
-          namespace: `${namespace}.Models`,
+          namespace: `${namespace}`,
           isBuiltIn: false,
           isValueType: true,
         }),
@@ -162,26 +187,38 @@ export function getCSharpType(
         if (resolvedItem === undefined) return undefined;
         const { type: itemType, value: _ } = resolvedItem;
 
+        const uniqueItems = getUniqueItems(program, type);
+        const isByte = ["byte", "SByte"].includes(itemType.name);
+        const collectionType = CSharpServiceOptions.getInstance().collectionType;
+
+        const returnTypeCollection = uniqueItems
+          ? CollectionType.ISet
+          : isByte
+            ? CollectionType.Array
+            : collectionType;
+
+        const returnType =
+          returnTypeCollection === CollectionType.Array
+            ? `${itemType.name}[]`
+            : `${returnTypeCollection}<${itemType.name}>`;
         return {
-          type: new CSharpType({
-            name: `${itemType.name}[]`,
-            namespace: itemType.namespace,
-            isBuiltIn: itemType.isBuiltIn,
-            isValueType: false,
-            isClass: itemType.isClass,
-            isCollection: true,
-          }),
+          type: new CSharpCollectionType(
+            {
+              name: returnType,
+              namespace: itemType.namespace,
+              isBuiltIn: itemType.isBuiltIn,
+              isValueType: false,
+              isClass: itemType.isClass,
+              isCollection: true,
+            },
+            returnTypeCollection,
+            itemType.name,
+          ),
         };
       }
       if (isRecord(type))
         return {
-          type: new CSharpType({
-            name: "JsonObject",
-            namespace: "System.Text.Json.Nodes",
-            isBuiltIn: false,
-            isValueType: false,
-            isClass: false,
-          }),
+          type: RecordType,
         };
       let name: string = type.name;
       if (isTemplateInstance(type)) {
@@ -190,7 +227,7 @@ export function getCSharpType(
       return {
         type: new CSharpType({
           name: ensureCSharpIdentifier(program, type, name, NameCasingType.Class),
-          namespace: `${namespace}.Models`,
+          namespace: `${namespace}`,
           isBuiltIn: false,
           isValueType: false,
           isClass: true,
@@ -199,6 +236,37 @@ export function getCSharpType(
     default:
       return undefined;
   }
+}
+
+export function resolveReferenceFromScopes(
+  targetDeclaration: Declaration<string>,
+  declarationScopes: Scope<string>[],
+  referenceScopes: Scope<string>[],
+): string | undefined {
+  function getSourceFile(
+    scopes: Scope<string>[],
+  ): { scope: Scope<string>; file: SourceFile<string> } | undefined {
+    for (const scope of scopes) {
+      if (scope.kind === "sourceFile") {
+        return { scope: scope, file: scope.sourceFile };
+      }
+    }
+
+    return undefined;
+  }
+  const decl = getSourceFile(declarationScopes);
+  const ref = getSourceFile(referenceScopes);
+  if (targetDeclaration.name && decl) {
+    const declNs = decl.file.meta["ResolvedNamespace"];
+    if (!ref) return declNs ? `${declNs}.${targetDeclaration.name} ` : undefined;
+    if (checkOrAddNamespaceToScope(declNs, ref.scope)) {
+      return targetDeclaration.name;
+    }
+
+    return declNs ? `${declNs}.${targetDeclaration.name} ` : undefined;
+  }
+
+  return undefined;
 }
 
 export function coalesceTypes(
@@ -482,8 +550,10 @@ export function formatComment(
 export function getCSharpIdentifier(
   name: string,
   context: NameCasingType = NameCasingType.Class,
+  checkReserved: boolean = true,
 ): string {
   if (name === undefined) return "Placeholder";
+  name = replaceCSharpReservedWord(name, context);
   switch (context) {
     case NameCasingType.Namespace:
       const parts: string[] = [];
@@ -506,6 +576,7 @@ export function ensureCSharpIdentifier(
   context: NameCasingType = NameCasingType.Class,
 ): string {
   let location = "";
+  let includeDot = false;
   switch (target.kind) {
     case "Enum":
       location = `enum ${target.name}`;
@@ -538,11 +609,9 @@ export function ensureCSharpIdentifier(
     case "Namespace":
       location = `namespace ${target.name}`;
       let invalid: boolean = false;
-      const nsName: StringBuilder = new StringBuilder();
       for (const part of name.split(".")) {
         if (!isValidCSharpIdentifier(part)) {
           invalid = true;
-          nsName.pushLiteralSegment(transformInvalidIdentifier(part));
         }
       }
 
@@ -552,9 +621,10 @@ export function ensureCSharpIdentifier(
           format: { identifier: name, location: location },
           target: target.node ?? NoTarget,
         });
-        return nsName.segments.join(".");
       }
-      return name;
+
+      includeDot = true;
+      break;
     case "Operation": {
       const parent = target.interface
         ? `interface ${target.interface.name}`
@@ -571,7 +641,7 @@ export function ensureCSharpIdentifier(
     }
   }
 
-  if (!isValidCSharpIdentifier(name)) {
+  if (!isValidCSharpIdentifier(name, includeDot)) {
     reportDiagnostic(program, {
       code: "invalid-identifier",
       format: { identifier: name, location: location },
@@ -735,7 +805,7 @@ export class HttpMetadata {
           (p: ModelProperty) => !isMetadata(program, p) && !isStatusCode(program, p),
         );
 
-        if (anyProp === undefined) return program.checker.voidType;
+        if (anyProp === undefined) return $(program).intrinsic.void;
 
         if (responseType.name === "") {
           return metaInfo.getEffectivePayloadType(responseType, Visibility.Read);
@@ -791,8 +861,151 @@ export async function ensureCleanDirectory(program: Program, targetPath: string)
   await program.host.mkdirp(targetPath);
 }
 
-export function isValidCSharpIdentifier(identifier: string): boolean {
-  return identifier?.match(/^[A-Za-z_][\w]*$/) !== null;
+export function isValidCSharpIdentifier(identifier: string, isNamespace: boolean = false): boolean {
+  if (!isNamespace) return identifier?.match(/^[A-Za-z_][\w]*$/) !== null;
+  return identifier?.match(/^[A-Za-z_][\w.]*$/) !== null;
+}
+
+export function replaceCSharpReservedWord(identifier: string, context?: NameCasingType): string {
+  function generateReplacement(input: string): [string, string] {
+    return [input, `${pascalCase(input)}Name`];
+  }
+  const contextualWords: string[] = [
+    "add",
+    "allows",
+    "alias",
+    "and",
+    "ascending",
+    "args",
+    "async",
+    "await",
+    "by",
+    "descending",
+    "dynamic",
+    "equals",
+    "field",
+    "file",
+    "from",
+    "get",
+    "global",
+    "group",
+    "init",
+    "into",
+    "join",
+    "let",
+    "managed",
+    "nameof",
+    "nint",
+    "not",
+    "notnull",
+    "nuint",
+    "on",
+    "or",
+    "orderby",
+    "partial",
+    "record",
+    "remove",
+    "required",
+    "scoped",
+    "select",
+    "set",
+    "unmanaged",
+    "value",
+    "var",
+    "when",
+    "where",
+    "with",
+    "yield",
+  ];
+  const reservedWords: string[] = [
+    "abstract",
+    "as",
+    "base",
+    "bool",
+    "boolean",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "checked",
+    "class",
+    "const",
+    "continue",
+    "decimal",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "event",
+    "explicit",
+    "extern",
+    "false",
+    "finally",
+    "fixed",
+    "float",
+    "for",
+    "foreach",
+    "goto",
+    "if",
+    "implicit",
+    "in",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lock",
+    "long",
+    "namespace",
+    "new",
+    "null",
+    "object",
+    "operator",
+    "out",
+    "override",
+    "params",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "ref",
+    "return",
+    "sbyte",
+    "sealed",
+    "short",
+    "sizeof",
+    "stackalloc",
+    "static",
+    "string",
+    "struct",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "uint",
+    "ulong",
+    "unchecked",
+    "unsafe",
+    "ushort",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
+  ];
+  const reserved: Map<string, string> = new Map<string, string>(
+    reservedWords.concat(contextualWords).map((w) => generateReplacement(w)),
+  );
+  const check = reserved.get(identifier.toLowerCase());
+  if (check !== undefined) {
+    return getCSharpIdentifier(check, context, false);
+  }
+
+  return identifier;
 }
 
 export function getValidChar(target: string, position: number): string {
@@ -819,9 +1032,34 @@ export function getCSharpStatusCode(entry: HttpStatusCodesEntry): string | undef
   }
 }
 
+/**
+ * Returns the full return statement for a controller action based on the HTTP status code.
+ * Maps well-known status codes to their idiomatic ASP.NET Core ControllerBase methods,
+ * and falls back to `StatusCode(code, ...)` for all other numeric codes.
+ */
+export function getControllerReturnStatement(
+  status: HttpStatusCodesEntry,
+  hasValue: boolean,
+): string {
+  if (typeof status === "number") {
+    switch (status) {
+      case 200:
+        return hasValue ? "return Ok(result);" : "return Ok();";
+      case 202:
+        return hasValue ? "return Accepted(result);" : "return Accepted();";
+      case 204:
+        return "return NoContent();";
+      default:
+        return hasValue ? `return StatusCode(${status}, result);` : `return StatusCode(${status});`;
+    }
+  }
+  // Fallback for ranges and "*"
+  return hasValue ? "return Ok(result);" : "return Ok();";
+}
+
 export function isEmptyResponseModel(program: Program, model: Type): boolean {
   if (model.kind !== "Model") return false;
-  if (model.properties.size === 0) return true;
+  if (model.properties.size === 0 && !model.baseModel) return true;
 
   return (
     model.properties.size === 1 &&
@@ -974,12 +1212,20 @@ export interface EmittedTypeInfo {
 export class CSharpOperationHelpers {
   constructor(inEmitter: AssetEmitter<string, CSharpServiceEmitterOptions>) {
     this.emitter = inEmitter;
-    this.#anonymousModels = new Map<Model, EmittedTypeInfo>();
+    this.#anonymousModels = new Map<Model, EmittedTypeInfo & { hasUniqueItems: boolean }>();
     this.#opCache = new Map<Operation, CSharpOperationParameter[]>();
   }
   emitter: AssetEmitter<string, CSharpServiceEmitterOptions>;
-  #anonymousModels: Map<Model, EmittedTypeInfo>;
+  #anonymousModels: Map<Model, EmittedTypeInfo & { hasUniqueItems: boolean }>;
   #opCache: Map<Operation, CSharpOperationParameter[]>;
+  getResponse(program: Program, operation: HttpOperation): CSharpType {
+    return new CSharpType({
+      name: "void",
+      namespace: "System",
+      isBuiltIn: true,
+      isValueType: true,
+    });
+  }
   getParameters(program: Program, operation: HttpOperation): CSharpOperationParameter[] {
     function safeConcat(...names: (string | undefined)[]): string {
       return names
@@ -992,7 +1238,7 @@ export class CSharpOperationHelpers {
     const bodyParam = operation.parameters.body;
     const isExplicitBodyParam: boolean = bodyParam?.property !== undefined;
     const result: CSharpOperationParameter[] = [];
-    if (operation.verb === "get" && operation.parameters.body !== undefined) {
+    if (!cached && operation.verb === "get" && operation.parameters.body !== undefined) {
       reportDiagnostic(program, {
         code: "get-request-body",
         target: operation.operation,
@@ -1102,7 +1348,7 @@ export class CSharpOperationHelpers {
               typeReference: csType,
               defaultValue: csValue,
               nullableType: isNullable,
-            } = this.getTypeInfo(program, propDef.type);
+            } = this.getTypeInfo(program, propDef.type, propDef);
             // cSharp does not allow array defaults in operation parameters
             if (!canHaveDefault(program, propDef)) {
               csValue = undefined;
@@ -1139,7 +1385,7 @@ export class CSharpOperationHelpers {
               typeReference: csType,
               defaultValue: csValue,
               nullableType: isNullable,
-            } = this.getTypeInfo(program, bodyParam.type.type);
+            } = this.getTypeInfo(program, bodyParam.type.type, bodyParam.type);
             if (!canHaveDefault(program, bodyParam.type)) {
               csValue = undefined;
             }
@@ -1191,7 +1437,7 @@ export class CSharpOperationHelpers {
         typeReference: paramType,
         defaultValue: paramValue,
         nullableType: isNullable,
-      } = this.getTypeInfo(program, parameter.param.type);
+      } = this.getTypeInfo(program, parameter.param.type, parameter.param);
       const optName = ensureCSharpIdentifier(
         program,
         parameter.param,
@@ -1212,10 +1458,53 @@ export class CSharpOperationHelpers {
       });
     }
 
-    this.#opCache.set(operation.operation, result);
     return result;
   }
-  getTypeInfo(program: Program, tsType: Type): EmittedTypeInfo {
+
+  getDefaultValue(
+    program: Program,
+    tsType: Type,
+    defaultValue: Value | undefined,
+  ): string | number | undefined {
+    if (defaultValue === undefined) return undefined;
+    switch (tsType.kind) {
+      case "Enum":
+        if (defaultValue.valueKind === "EnumValue") {
+          const retVal = this.getTypeInfo(program, tsType);
+          return `${retVal.typeReference}.${ensureCSharpIdentifier(program, defaultValue.value, defaultValue.value.name, NameCasingType.Property)}`;
+        }
+        return JSON.stringify(
+          serializeValueAsJson(this.emitter.getProgram(), defaultValue, tsType),
+        );
+      case "Union":
+        const { typeReference: typeRef } = this.getUnionInfo(program, tsType);
+        if (defaultValue.valueKind === "StringValue" && isStringEnumType(program, tsType)) {
+          const matches = [...tsType.variants].filter(
+            (v) =>
+              typeof v[0] === "string" &&
+              v[1].type.kind === "String" &&
+              v[1].type.value === defaultValue.value,
+          );
+          if (matches.length === 1) {
+            return `${typeRef}.${ensureCSharpIdentifier(program, matches[0][1], matches[0][0] as string, NameCasingType.Property)}`;
+          }
+
+          return undefined;
+        }
+        if (defaultValue.valueKind === "StringValue") {
+          return JSON.stringify(
+            serializeValueAsJson(this.emitter.getProgram(), defaultValue, tsType),
+          );
+        }
+
+        return undefined;
+      default:
+        return JSON.stringify(
+          serializeValueAsJson(this.emitter.getProgram(), defaultValue, tsType),
+        );
+    }
+  }
+  getTypeInfo(program: Program, tsType: Type, modelProperty?: ModelProperty): EmittedTypeInfo {
     const myEmitter = this.emitter;
     function extractStringValue(type: Type, span: StringTemplateSpan): string {
       switch (type.kind) {
@@ -1287,32 +1576,66 @@ export class CSharpOperationHelpers {
           const { defaultValue: itemDefault } = this.getTypeInfo(program, value);
           defaults.push(itemDefault);
         }
-        return {
-          typeReference: code`${csharpType.getTypeReference()}[]`,
-          defaultValue: `[${defaults.join(", ")}]`,
-          nullableType: csharpType.isNullable,
-        };
+        const collectionType = CSharpServiceOptions.getInstance().collectionType;
+
+        switch (collectionType) {
+          case CollectionType.IEnumerable:
+            return {
+              typeReference: code`IEnumerable<${csharpType.getTypeReference(myEmitter.getContext()?.scope)}>`,
+              defaultValue: `new List<${csharpType.getTypeReference(myEmitter.getContext()?.scope)}> {${defaults.join(", ")}}`,
+              nullableType: csharpType.isNullable,
+            };
+          case CollectionType.Array:
+          default:
+            return {
+              typeReference: code`${csharpType.getTypeReference(myEmitter.getContext()?.scope)}[]`,
+              defaultValue: `[${defaults.join(", ")}]`,
+              nullableType: csharpType.isNullable,
+            };
+        }
+
       case "Model":
-        let modelResult: EmittedTypeInfo;
+        let modelResult: EmittedTypeInfo & { hasUniqueItems: boolean };
+        const hasUniqueItems = modelProperty
+          ? getUniqueItems(program, modelProperty) !== undefined
+          : false;
+
         const cachedResult = this.#anonymousModels.get(tsType);
-        if (cachedResult) {
+        if (cachedResult && cachedResult.hasUniqueItems === hasUniqueItems) {
           return cachedResult;
         }
+
         if (isRecord(tsType)) {
           modelResult = {
-            typeReference: code`System.Text.Json.Nodes.JsonObject`,
+            typeReference: code`${RecordType.getTypeReference(myEmitter.getContext().scope)}`,
             nullableType: false,
+            hasUniqueItems: hasUniqueItems,
           };
+        } else if (isArrayModelType(tsType)) {
+          const typeReference = code`${this.emitter.emitTypeReference(tsType.indexer.value)}`;
+          modelResult = isByteType(tsType.indexer.value)
+            ? {
+                typeReference: code`${typeReference}[]`,
+                nullableType: false,
+                hasUniqueItems: hasUniqueItems,
+              }
+            : {
+                typeReference: hasUniqueItems
+                  ? code`ISet<${typeReference}>`
+                  : code`${this.emitter.emitTypeReference(tsType)}`,
+                nullableType: false,
+                hasUniqueItems: hasUniqueItems,
+              };
         } else {
           modelResult = {
-            typeReference: code`${this.emitter.emitTypeReference(tsType)}`,
+            typeReference: code`${this.emitter.emitTypeReference(tsType, this.emitter.getContext())}`,
             nullableType: false,
+            hasUniqueItems: hasUniqueItems,
           };
         }
-        this.#anonymousModels.set(tsType, modelResult);
         return modelResult;
       case "ModelProperty":
-        return this.getTypeInfo(program, tsType.type);
+        return this.getTypeInfo(program, tsType.type, tsType);
       case "Enum":
         if (getEnumType(tsType) === "double")
           return { typeReference: getDoubleType().getTypeReference(), nullableType: false };
@@ -1328,12 +1651,23 @@ export class CSharpOperationHelpers {
           return { typeReference: "int", defaultValue: stringValue, nullableType: false };
         }
         if (typeof tsType.value === "string") {
-          return { typeReference: "string", defaultValue: tsType.value, nullableType: false };
+          const retVal = this.getTypeInfo(program, tsType.enum);
+          retVal.defaultValue = `${retVal.typeReference}.${ensureCSharpIdentifier(program, tsType, tsType.name, NameCasingType.Property)}`;
+          return retVal;
         }
         return { typeReference: code`object`, nullableType: false };
       case "Union":
         return this.getUnionInfo(program, tsType);
       case "UnionVariant":
+        if (
+          isStringEnumType(program, tsType.union) &&
+          tsType.type.kind === "String" &&
+          typeof tsType.name === "string"
+        ) {
+          const retVal = this.getUnionInfo(program, tsType.union);
+          retVal.defaultValue = `${retVal.typeReference}.${ensureCSharpIdentifier(program, tsType, tsType.name, NameCasingType.Property)}`;
+          return retVal;
+        }
         return this.getTypeInfo(program, tsType.type);
       default:
         return {
@@ -1344,7 +1678,7 @@ export class CSharpOperationHelpers {
   }
   getUnionInfo(program: Program, union: Union): EmittedTypeInfo {
     const propResult = getNonNullableTsType(union);
-    if (propResult === undefined) {
+    if (propResult === undefined || isStringEnumType(program, union)) {
       return {
         typeReference: code`${this.emitter.emitTypeReference(union)}`,
         nullableType: [...union.variants.values()].some((v) => isNullType(v.type)),
@@ -1384,6 +1718,18 @@ export function findNumericType(type: NumericLiteral): [string, string] {
   return ["int", stringValue];
 }
 
+export function isStringEnumType(program: Program, union: Union): boolean {
+  const baseType = coalesceUnionTypes(program, union);
+  if (!baseType.isBuiltIn || baseType.name !== "string") return false;
+  return ![...union.variants.values()].some(
+    (v) =>
+      (v.type.kind === "String" ||
+        v.type.kind === "StringTemplate" ||
+        v.type.kind === "StringTemplateSpan") &&
+      typeof v.name !== "string",
+  );
+}
+
 export function coalesceUnionTypes(program: Program, union: Union): CSharpType {
   const [result, _] = coalesceTsTypes(
     program,
@@ -1413,7 +1759,7 @@ export function coalesceTsTypes(program: Program, types: Type[]): [CSharpType, b
   let current: CSharpType | undefined = undefined;
   let nullable: boolean = false;
   for (const type of types) {
-    let candidate: CSharpType | undefined = undefined;
+    let candidate: CSharpType | undefined;
     switch (type.kind) {
       case "Boolean":
         candidate = new CSharpType({ name: "bool", namespace: "System", isValueType: true });
@@ -1476,6 +1822,8 @@ export async function getFreePort(minPort: number, maxPort: number, tries: numbe
   if (free) {
     return port;
   }
+  // This seems like a bug? tries-- does nothing?
+  // eslint-disable-next-line no-useless-assignment
   return await getFreePort(min, max, tries--);
 
   async function checkPort(port: number, timeout: number = 100): Promise<boolean> {
@@ -1546,5 +1894,24 @@ export function getStatusCode(program: Program, model: Model) {
       };
     default:
       return { value: getMinValue(program, statusCodeProperty) ?? `default` };
+  }
+}
+
+export function isByteType(type: Type): boolean {
+  return type.kind === "Scalar" && ["int8", "uint8"].includes(type.name);
+}
+
+export function getImports(scope?: Scope<string>, visited?: Set<Scope<string>>): string[] {
+  if (scope === undefined) return [];
+  if (!visited) visited = new Set<Scope<string>>();
+  if (visited.has(scope)) return [];
+  visited.add(scope);
+  switch (scope.kind) {
+    case "namespace":
+      return getImports(scope.parentScope, visited);
+    case "sourceFile":
+      return [...scope.sourceFile.imports.keys()];
+    default:
+      return [];
   }
 }

@@ -1,6 +1,6 @@
 # @typespec/openapi3
 
-TypeSpec library for emitting OpenAPI 3.0 from the TypeSpec REST protocol binding and converting OpenAPI3 to TypeSpec
+TypeSpec library for emitting OpenAPI 3.0 and OpenAPI 3.1 from the TypeSpec REST protocol binding and converting OpenAPI3 to TypeSpec
 
 ## Install
 
@@ -8,7 +8,7 @@ TypeSpec library for emitting OpenAPI 3.0 from the TypeSpec REST protocol bindin
 npm install @typespec/openapi3
 ```
 
-## Usage
+## Emitter usage
 
 1. Via the command line
 
@@ -35,11 +35,18 @@ options:
 
 ## Emitter options
 
+### `emitter-output-dir`
+
+**Type:** `absolutePath`
+
+Defines the emitter output directory. Defaults to `{output-dir}/@typespec/openapi3`
+See [Configuring output directory for more info](https://typespec.io/docs/handbook/configuration/configuration/#configuring-output-directory)
+
 ### `file-type`
 
-**Type:** `"yaml" | "json"`
+**Type:** `string,array`
 
-If the content should be serialized as YAML or JSON. Default 'yaml', it not specified infer from the `output-file` extension
+If the content should be serialized as YAML or JSON. Can be a single value or an array to emit multiple formats. Default 'yaml', if not specified infer from the `output-file` extension
 
 ### `output-file`
 
@@ -51,8 +58,10 @@ Output file will interpolate the following values:
 - service-name: Name of the service
 - service-name-if-multiple: Name of the service if multiple
 - version: Version of the service if multiple
+- file-type: The file type being emitted (json or yaml). Useful when `file-type` is an array.
 
 Default: `{service-name-if-multiple}.{version}.openapi.yaml` or `.json` if `file-type` is `"json"`
+When `file-type` is an array: `{service-name-if-multiple}.{version}.openapi.{file-type}`
 
 Example Single service no versioning
 
@@ -117,6 +126,19 @@ Default: `int64`
 If true, then for models emitted as object schemas we default `additionalProperties` to false for
 OpenAPI 3.0, and `unevaluatedProperties` to false for OpenAPI 3.1, if not explicitly specified elsewhere.
 Default: `false`
+
+### `experimental-parameter-examples`
+
+**Type:** `"data" | "serialized"`
+
+Determines how to emit examples on parameters.
+Note: This is an experimental feature and may change in future versions.
+See https://spec.openapis.org/oas/v3.0.4.html#style-examples for parameter example serialization rules
+See https://github.com/OAI/OpenAPI-Specification/discussions/4622 for discussion on handling parameter examples.
+
+### `operation-id-strategy`
+
+**Type:** `undefined`
 
 ## Decorators
 

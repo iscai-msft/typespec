@@ -1,5 +1,4 @@
 import {
-  $service,
   compilerAssert,
   DecoratorContext,
   getDoc,
@@ -10,7 +9,9 @@ import {
   Namespace,
   Operation,
   Program,
+  serializeValueAsJson,
   Type,
+  Value,
 } from "@typespec/compiler";
 import { useStateMap } from "@typespec/compiler/utils";
 import * as http from "@typespec/http";
@@ -27,7 +28,20 @@ import { validateAdditionalInfoModel, validateIsUri } from "./helpers.js";
 import { createStateSymbol, OpenAPIKeys, reportDiagnostic } from "./lib.js";
 import { AdditionalInfo, ExtensionKey, ExternalDocs } from "./types.js";
 
-const operationIdsKey = createStateSymbol("operationIds");
+export const [
+  /**
+   * Returns operationId set via the `@operationId` decorator or `undefined`
+   */
+  getOperationId,
+
+  /**
+   * Set a specific operation ID programmatically. Equivalent of using `@operationId` decorator.
+   * @param program TypeSpec Program
+   * @param entity Operation to set ID for
+   * @param opId Operation ID
+   */
+  setOperationId,
+] = useStateMap<Operation, string>(createStateSymbol("operationIds"));
 /**
  * Set a specific operation ID.
  * @param context Decorator Context
@@ -39,15 +53,8 @@ export const $operationId: OperationIdDecorator = (
   entity: Operation,
   opId: string,
 ) => {
-  context.program.stateMap(operationIdsKey).set(entity, opId);
+  setOperationId(context.program, entity, opId);
 };
-
-/**
- * Returns operationId set via the `@operationId` decorator or `undefined`
- */
-export function getOperationId(program: Program, entity: Operation): string | undefined {
-  return program.stateMap(operationIdsKey).get(entity);
-}
 
 const openApiExtensionKey = createStateSymbol("openApiExtension");
 
@@ -63,8 +70,46 @@ export const $extension: ExtensionDecorator = (
     "OpenAPI extension value must be a value but was a type",
     context.getArgumentTarget(1),
   );
-  setExtension(context.program, entity, extensionName as ExtensionKey, value);
+  const processed = convertRemainingValuesToExtensions(context.program, value);
+  setExtension(context.program, entity, extensionName as ExtensionKey, processed);
 };
+
+// Workaround until we have a way to disable arg marshalling and just call serializeValueAsJson
+// https://github.com/microsoft/typespec/issues/3570
+function convertRemainingValuesToExtensions(program: Program, value: unknown): unknown {
+  switch (typeof value) {
+    case "string":
+    case "number":
+    case "boolean":
+      return value;
+    case "object":
+      if (value === null) {
+        return null;
+      }
+      if (Array.isArray(value)) {
+        return value.map((x) => convertRemainingValuesToExtensions(program, x));
+      }
+
+      if (isTypeSpecValue(value)) {
+        return serializeValueAsJson(program, value, value.type);
+      } else {
+        const result: Record<string, unknown> = {};
+        for (const [key, val] of Object.entries(value)) {
+          if (val === undefined) {
+            continue;
+          }
+          result[key] = convertRemainingValuesToExtensions(program, val);
+        }
+        return result;
+      }
+    default:
+      return value;
+  }
+}
+
+function isTypeSpecValue(value: object): value is Value {
+  return "entityKind" in value && value.entityKind === "Value";
+}
 
 /**
  * Set the OpenAPI info node on for the given service namespace.
@@ -242,7 +287,13 @@ export const tagMetadataDecorator: TagMetadataDecorator = (
   tagMetadata: TagMetadata,
 ) => {
   // Check if the namespace is a service namespace
-  if (!entity.decorators.some((decorator) => decorator.decorator === $service)) {
+  if (
+    !entity.decorators.some(
+      (decorator) =>
+        decorator.definition?.name === "@service" &&
+        decorator.definition?.namespace.name === "TypeSpec",
+    )
+  ) {
     reportDiagnostic(context.program, {
       code: "tag-metadata-target-service",
       format: {

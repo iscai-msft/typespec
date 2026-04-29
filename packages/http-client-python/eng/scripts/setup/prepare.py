@@ -6,8 +6,6 @@
 # license information.
 # --------------------------------------------------------------------------
 import sys
-import os
-import argparse
 
 if not sys.version_info >= (3, 9, 0):
     raise Warning(
@@ -15,10 +13,9 @@ if not sys.version_info >= (3, 9, 0):
     )
 
 from pathlib import Path
-import venv
+from package_manager import create_venv_with_package_manager, install_packages
 
-from venvtools import python_run
-
+# eng/scripts/setup/prepare.py -> need to go up 4 levels to get to package root
 _ROOT_DIR = Path(__file__).parent.parent.parent.parent
 
 
@@ -28,14 +25,10 @@ def main():
 
     assert venv_preexists  # Otherwise install was not done
 
-    env_builder = venv.EnvBuilder(with_pip=True)
-    venv_context = env_builder.ensure_directories(venv_path)
+    venv_context = create_venv_with_package_manager(venv_path)
+
     try:
-        python_run(
-            venv_context,
-            "pip",
-            ["install", "-r", f"{_ROOT_DIR}/generator/dev_requirements.txt"],
-        )
+        install_packages(["-r", f"{_ROOT_DIR}/generator/dev_requirements.txt"], venv_context, cwd=_ROOT_DIR)
     except FileNotFoundError as e:
         raise ValueError(e.filename)
 

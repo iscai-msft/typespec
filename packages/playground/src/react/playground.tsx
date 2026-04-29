@@ -1,5 +1,6 @@
 import type { CompilerOptions, Diagnostic } from "@typespec/compiler";
-import { Pane, SplitPane, useControllableValue } from "@typespec/react-components";
+import { $ } from "@typespec/compiler/typekit";
+import { Pane, SplitPane } from "@typespec/react-components";
 import "@typespec/react-components/style.css";
 import debounce from "debounce";
 import { KeyCode, KeyMod, MarkerSeverity, Uri, editor } from "monaco-editor";
@@ -15,63 +16,70 @@ import {
 import { CompletionItemTag } from "vscode-languageserver";
 import { resolveVirtualPath } from "../browser-host.js";
 import { EditorCommandBar } from "../editor-command-bar/editor-command-bar.js";
-import { getMonacoRange } from "../services.js";
+import { getMonacoRange, updateDiagnosticsForCodeFixes } from "../services.js";
 import type { BrowserHost, PlaygroundSample } from "../types.js";
 import { PlaygroundContextProvider } from "./context/playground-context.js";
+import { debugGlobals, printDebugInfo } from "./debug.js";
 import { DefaultFooter } from "./default-footer.js";
+import { EditorPanel } from "./editor-panel/editor-panel.js";
 import { useMonacoModel, type OnMountData } from "./editor.js";
 import { OutputView } from "./output-view/output-view.js";
 import style from "./playground.module.css";
 import { ProblemPane } from "./problem-pane/index.js";
+import type { CommandBarItem } from "./responsive-command-bar/index.js";
 import type { CompilationState, FileOutputViewer, ProgramViewer } from "./types.js";
-import { TypeSpecEditor } from "./typespec-editor.js";
+import { useIsMobile } from "./use-mobile.js";
+import { usePlaygroundState, type PlaygroundState } from "./use-playground-state.js";
+import { ViewToggle, type ViewMode } from "./view-toggle.js";
+
+// Re-export the PlaygroundState type for convenience
+export type { PlaygroundState };
+
+export interface PlaygroundEmitterOptions {
+  /** Compile debounce delay in milliseconds. Default is 200. */
+  debounce?: number;
+}
 
 export interface PlaygroundProps {
   host: BrowserHost;
 
-  /** Default emitter if leaving this unmanaged. */
+  /** Default content if leaving this unmanaged. */
   defaultContent?: string;
 
   /** List of available libraries */
   readonly libraries: readonly string[];
 
-  /** Emitter to use */
-  emitter?: string;
-  /** Default emitter if leaving this unmanaged. */
-  defaultEmitter?: string;
-  /** Callback when emitter change */
-  onEmitterChange?: (emitter: string) => void;
-
-  /** Emitter options */
-  compilerOptions?: CompilerOptions;
-  /** Default emitter options if leaving this unmanaged. */
-  defaultCompilerOptions?: CompilerOptions;
-  /** Callback when emitter options change */
-  onCompilerOptionsChange?: (emitter: CompilerOptions) => void;
-
   /** Samples available */
   samples?: Record<string, PlaygroundSample>;
 
-  /** Sample to use */
-  sampleName?: string;
-  /** Default sample if leaving this unmanaged. */
-  defaultSampleName?: string;
-  /** Callback when sample change */
-  onSampleNameChange?: (sampleName: string) => void;
+  /** Playground state (controlled) */
+  playgroundState?: PlaygroundState;
+  /** Default playground state if leaving this unmanaged */
+  defaultPlaygroundState?: PlaygroundState;
+  /** Callback when playground state changes */
+  onPlaygroundStateChange?: (state: PlaygroundState) => void;
+
+  /**
+   * Default emitter to use if not provided in defaultPlaygroundState.
+   * @deprecated Use defaultPlaygroundState.emitter instead
+   */
+  defaultEmitter?: string;
 
   onFileBug?: () => void;
 
-  /** Additional buttons to show up in the command bar */
-  commandBarButtons?: ReactNode;
-
-  /** Playground links */
-  links?: PlaygroundLinks;
+  /** Additional items to show in the command bar. */
+  commandBarItems?: CommandBarItem[];
 
   /** Custom viewers to view the typespec program */
   viewers?: ProgramViewer[];
 
   /** Custom file viewers that enabled for certain emitters. Key of the map is emitter name */
   emitterViewers?: Record<string, FileOutputViewer[]>;
+
+  /**
+   * Per-emitter playground options. Key is the emitter name.
+   */
+  emitterOptions?: Record<string, PlaygroundEmitterOptions>;
 
   onSave?: (value: PlaygroundSaveData) => void;
 
@@ -87,25 +95,59 @@ export interface PlaygroundEditorsOptions {
   theme?: string;
 }
 
-export interface PlaygroundSaveData {
+export interface PlaygroundSaveData extends PlaygroundState {
   /** Current content of the playground.   */
   content: string;
 
   /** Emitter name. */
   emitter: string;
-
-  /** Emitter options. */
-  options?: CompilerOptions;
-
-  /** If a sample is selected and the content hasn't changed since. */
-  sampleName?: string;
 }
 
-export interface PlaygroundLinks {
-  /** Link to documentation */
-  documentationUrl?: string;
-}
-
+/**
+ * Playground component for TypeSpec with consolidated state management.
+ *
+ * @example
+ * ```tsx
+ * const [playgroundState, setPlaygroundState] = useState<PlaygroundState>({
+ *   emitter: 'openapi3',
+ *   compilerOptions: {},
+ *   sampleName: 'basic',
+ *   selectedViewer: 'openapi',
+ *   viewerState: {}
+ * });
+ *
+ * <Playground
+ *   host={host}
+ *   playgroundState={playgroundState}
+ *   onPlaygroundStateChange={setPlaygroundState}
+ *   samples={samples}
+ *   viewers={viewers}
+ * />
+ * ```
+ *
+ * For uncontrolled usage, use defaultPlaygroundState:
+ * ```tsx
+ * <Playground
+ *   host={host}
+ *   defaultPlaygroundState={{
+ *     emitter: 'openapi3',
+ *     compilerOptions: {},
+ *   }}
+ *   samples={samples}
+ *   viewers={viewers}
+ * />
+ * ```
+ *
+ * For backward compatibility, you can also use the deprecated defaultEmitter prop:
+ * ```tsx
+ * <Playground
+ *   host={host}
+ *   defaultEmitter="openapi3"
+ *   samples={samples}
+ *   viewers={viewers}
+ * />
+ * ```
+ */
 export const Playground: FunctionComponent<PlaygroundProps> = (props) => {
   const { host, onSave } = props;
   const editorRef = useRef<editor.IStandaloneCodeEditor | undefined>(undefined);
@@ -114,35 +156,134 @@ export const Playground: FunctionComponent<PlaygroundProps> = (props) => {
     editor.setTheme(props.editorOptions?.theme ?? "typespec");
   }, [props.editorOptions?.theme]);
 
-  const [selectedEmitter, onSelectedEmitterChange] = useControllableValue(
-    props.emitter,
-    props.defaultEmitter,
-    props.onEmitterChange,
-  );
-  const [compilerOptions, onCompilerOptionsChange] = useControllableValue(
-    props.compilerOptions,
-    props.defaultCompilerOptions ?? {},
-    props.onCompilerOptionsChange,
-  );
-  const [selectedSampleName, onSelectedSampleNameChange] = useControllableValue(
-    props.sampleName,
-    props.defaultSampleName,
-    props.onSampleNameChange,
-  );
-  const [content, setContent] = useState(props.defaultContent);
+  useEffect(() => {
+    printDebugInfo();
+
+    debugGlobals().host = host;
+  }, [host]);
+
+  const typespecModel = useMonacoModel("inmemory://test/main.tsp", "typespec");
+  const [compilationState, setCompilationState] = useState<CompilationState | undefined>(undefined);
+  const lastSuccessfulOutputRef = useRef<string[]>([]);
+  const [isCompiling, setIsCompiling] = useState(false);
+  const [isOutputStale, setIsOutputStale] = useState(false);
+
+  // Use the playground state hook
+  const state = usePlaygroundState({
+    libraries: props.libraries,
+    samples: props.samples,
+    playgroundState: props.playgroundState,
+    defaultPlaygroundState: props.defaultPlaygroundState,
+    onPlaygroundStateChange: props.onPlaygroundStateChange,
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    defaultEmitter: props.defaultEmitter,
+    defaultContent: props.defaultContent,
+  });
+
+  // Extract values from the state hook
+  const {
+    selectedEmitter,
+    compilerOptions,
+    selectedSampleName,
+    selectedViewer,
+    viewerState,
+    content,
+    onSelectedEmitterChange,
+    onCompilerOptionsChange,
+    onSelectedSampleNameChange,
+    onSelectedViewerChange,
+    onViewerStateChange,
+    onContentChange,
+  } = state;
+
+  // Clear preserved output when switching emitters
+  useEffect(() => {
+    lastSuccessfulOutputRef.current = [];
+    setIsOutputStale(false);
+  }, [selectedEmitter]);
+
+  // Sync Monaco model with state content
+  useEffect(() => {
+    if (typespecModel.getValue() !== (content ?? "")) {
+      typespecModel.setValue(content ?? "");
+    }
+  }, [content, typespecModel]);
+
+  // Update state when Monaco model changes
+  useEffect(() => {
+    const disposable = typespecModel.onDidChangeContent(() => {
+      const newContent = typespecModel.getValue();
+      if (newContent !== content) {
+        onContentChange(newContent);
+      }
+    });
+    return () => disposable.dispose();
+  }, [typespecModel, content, onContentChange]);
+
   const isSampleUntouched = useMemo(() => {
     return Boolean(selectedSampleName && content === props.samples?.[selectedSampleName]?.content);
   }, [content, selectedSampleName, props.samples]);
-  const typespecModel = useMonacoModel("inmemory://test/main.tsp", "typespec");
-  const [compilationState, setCompilationState] = useState<CompilationState | undefined>(undefined);
+
+  const compileIdRef = useRef(0);
+  const isCompilingRef = useRef(false);
+  const pendingRecompileRef = useRef(false);
+  const doCompileRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
   const doCompile = useCallback(async () => {
-    const content = typespecModel.getValue();
-    setContent(content);
+    // If a compile is already in progress, mark that a recompile is needed and
+    // bail out. The in-flight compile will re-trigger on completion. This avoids
+    // stacking up synchronous compiles that block the UI thread during typing.
+    if (isCompilingRef.current) {
+      pendingRecompileRef.current = true;
+      return;
+    }
+    const currentContent = typespecModel.getValue();
     const typespecCompiler = host.compiler;
+    const compileId = ++compileIdRef.current;
 
-    const state = await compile(host, content, selectedEmitter, compilerOptions);
-    setCompilationState(state);
+    isCompilingRef.current = true;
+    setIsCompiling(true);
+    let state: CompilationState;
+    try {
+      state = await compile(host, currentContent, selectedEmitter, compilerOptions);
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("Compilation failed", error);
+      isCompilingRef.current = false;
+      setIsCompiling(false);
+      if (pendingRecompileRef.current) {
+        pendingRecompileRef.current = false;
+        void doCompileRef.current();
+      }
+      return;
+    }
+    isCompilingRef.current = false;
+    setIsCompiling(false);
+
+    // Discard stale results from an older compilation
+    if (compileId !== compileIdRef.current) return;
+
+    // When compilation has errors and produced no output files, preserve the
+    // previous successful output so the user doesn't lose their selected file
+    // while typing (transient syntax errors).
+    if (
+      "program" in state &&
+      state.program.hasError() &&
+      state.outputFiles.length === 0 &&
+      lastSuccessfulOutputRef.current.length > 0
+    ) {
+      setIsOutputStale(true);
+      setCompilationState({
+        ...state,
+        outputFiles: lastSuccessfulOutputRef.current,
+      });
+    } else {
+      setIsOutputStale(false);
+      if ("program" in state && state.outputFiles.length > 0) {
+        lastSuccessfulOutputRef.current = state.outputFiles;
+      }
+      setCompilationState(state);
+    }
     if ("program" in state) {
       const markers: editor.IMarkerData[] = state.program.diagnostics.map((diag) => ({
         ...getMonacoRange(typespecCompiler, diag.target),
@@ -151,53 +292,44 @@ export const Playground: FunctionComponent<PlaygroundProps> = (props) => {
         tags: diag.code === "deprecated" ? [CompletionItemTag.Deprecated] : undefined,
       }));
 
+      // Update code action provider with current diagnostics (for codefix support).
+      updateDiagnosticsForCodeFixes(typespecCompiler, state.program.diagnostics);
+
+      // Set the program on the window.
+      debugGlobals().program = state.program;
+      debugGlobals().$$ = $(state.program);
+
       editor.setModelMarkers(typespecModel, "owner", markers ?? []);
     } else {
+      updateDiagnosticsForCodeFixes(typespecCompiler, []);
       editor.setModelMarkers(typespecModel, "owner", []);
     }
-  }, [host, selectedEmitter, compilerOptions, typespecModel, setContent]);
 
-  const updateTypeSpec = useCallback(
-    (value: string) => {
-      if (typespecModel.getValue() !== value) {
-        typespecModel.setValue(value);
-      }
-    },
-    [typespecModel],
-  );
-  useEffect(() => {
-    updateTypeSpec(props.defaultContent ?? "");
-  }, [props.defaultContent, updateTypeSpec]);
-
-  useEffect(() => {
-    if (selectedSampleName && props.samples) {
-      const config = props.samples[selectedSampleName];
-      if (config.content) {
-        updateTypeSpec(config.content);
-        if (config.preferredEmitter) {
-          onSelectedEmitterChange(config.preferredEmitter);
-        }
-        if (config.compilerOptions) {
-          onCompilerOptionsChange(config.compilerOptions);
-        }
-      }
+    // If typing happened while this compile was running, trigger a trailing
+    // compile so the output stays in sync with the latest content.
+    if (pendingRecompileRef.current) {
+      pendingRecompileRef.current = false;
+      void doCompileRef.current();
     }
-  }, [
-    updateTypeSpec,
-    selectedSampleName,
-    props.samples,
-    onSelectedEmitterChange,
-    onCompilerOptionsChange,
-  ]);
+  }, [host, selectedEmitter, compilerOptions, typespecModel]);
 
   useEffect(() => {
-    const debouncer = debounce(() => doCompile(), 200);
+    doCompileRef.current = doCompile;
+  }, [doCompile]);
+
+  const currentEmitterOptions = selectedEmitter
+    ? props.emitterOptions?.[selectedEmitter]
+    : undefined;
+
+  useEffect(() => {
+    const delay = currentEmitterOptions?.debounce ?? 200;
+    const debouncer = debounce(() => doCompile(), delay);
     const disposable = typespecModel.onDidChangeContent(debouncer);
     return () => {
       debouncer.clear();
       disposable.dispose();
     };
-  }, [typespecModel, doCompile]);
+  }, [typespecModel, doCompile, currentEmitterOptions?.debounce]);
 
   useEffect(() => {
     void doCompile();
@@ -206,19 +338,23 @@ export const Playground: FunctionComponent<PlaygroundProps> = (props) => {
   const saveCode = useCallback(() => {
     if (onSave) {
       onSave({
-        content: typespecModel.getValue(),
+        content: content ?? "",
         emitter: selectedEmitter,
-        options: compilerOptions,
+        compilerOptions,
         sampleName: isSampleUntouched ? selectedSampleName : undefined,
+        selectedViewer,
+        viewerState,
       });
     }
   }, [
-    typespecModel,
+    content,
     onSave,
     selectedEmitter,
     compilerOptions,
     selectedSampleName,
     isSampleUntouched,
+    selectedViewer,
+    viewerState,
   ]);
 
   const formatCode = useCallback(() => {
@@ -273,50 +409,88 @@ export const Playground: FunctionComponent<PlaygroundProps> = (props) => {
       host,
       setContent: (val: string) => {
         typespecModel.setValue(val);
-        setContent(val);
+        onContentChange(val);
       },
     };
-  }, [host, setContent, typespecModel]);
+  }, [host, typespecModel, onContentChange]);
+
+  const isMobile = useIsMobile();
+  const [viewMode, setViewMode] = useState<ViewMode>("editor");
+
+  // Reset to "editor" when entering mobile, force "both" on desktop
+  useEffect(() => {
+    if (!isMobile) {
+      setViewMode("both");
+    } else {
+      setViewMode("editor");
+    }
+  }, [isMobile]);
+
+  const commandBar = (
+    <EditorCommandBar
+      host={host}
+      selectedEmitter={selectedEmitter}
+      onSelectedEmitterChange={onSelectedEmitterChange}
+      samples={props.samples}
+      selectedSampleName={selectedSampleName}
+      onSelectedSampleNameChange={onSelectedSampleNameChange}
+      saveCode={saveCode}
+      formatCode={formatCode}
+      fileBug={props.onFileBug ? fileBug : undefined}
+      commandBarItems={props.commandBarItems}
+    />
+  );
+
+  const editorPanel = (
+    <EditorPanel
+      host={host}
+      model={typespecModel}
+      actions={typespecEditorActions}
+      editorOptions={props.editorOptions}
+      onMount={onTypeSpecEditorMount}
+      selectedEmitter={selectedEmitter}
+      compilerOptions={compilerOptions}
+      onCompilerOptionsChange={onCompilerOptionsChange}
+      onSelectedEmitterChange={onSelectedEmitterChange}
+      commandBar={isMobile ? undefined : commandBar}
+    />
+  );
+
+  const outputPanel = (
+    <OutputView
+      compilationState={compilationState}
+      isCompiling={isCompiling}
+      isOutputStale={isOutputStale}
+      editorOptions={props.editorOptions}
+      viewers={props.viewers}
+      fileViewers={selectedEmitter ? props.emitterViewers?.[selectedEmitter] : undefined}
+      selectedViewer={selectedViewer}
+      onViewerChange={onSelectedViewerChange}
+      viewerState={viewerState}
+      onViewerStateChange={onViewerStateChange}
+    />
+  );
+
+  const mainContent =
+    viewMode === "both" ? (
+      <SplitPane initialSizes={["50%", "50%"]}>
+        <Pane className={style["edit-pane"]}>{editorPanel}</Pane>
+        <Pane>{outputPanel}</Pane>
+      </SplitPane>
+    ) : viewMode === "editor" ? (
+      <div className={style["single-pane"]}>{editorPanel}</div>
+    ) : (
+      <div className={style["single-pane"]}>{outputPanel}</div>
+    );
 
   return (
     <PlaygroundContextProvider value={playgroundContext}>
       <div className={style["layout"]}>
+        {isMobile && (
+          <ViewToggle viewMode={viewMode} onViewModeChange={setViewMode} actions={commandBar} />
+        )}
         <SplitPane sizes={verticalPaneSizes} onChange={onVerticalPaneSizeChange} split="horizontal">
-          <Pane>
-            <SplitPane initialSizes={["50%", "50%"]}>
-              <Pane className={style["edit-pane"]}>
-                <EditorCommandBar
-                  host={host}
-                  selectedEmitter={selectedEmitter}
-                  onSelectedEmitterChange={onSelectedEmitterChange}
-                  compilerOptions={compilerOptions}
-                  onCompilerOptionsChange={onCompilerOptionsChange}
-                  samples={props.samples}
-                  selectedSampleName={selectedSampleName}
-                  onSelectedSampleNameChange={onSelectedSampleNameChange}
-                  saveCode={saveCode}
-                  formatCode={formatCode}
-                  fileBug={props.onFileBug ? fileBug : undefined}
-                  commandBarButtons={props.commandBarButtons}
-                  documentationUrl={props.links?.documentationUrl}
-                />
-                <TypeSpecEditor
-                  model={typespecModel}
-                  actions={typespecEditorActions}
-                  options={props.editorOptions}
-                  onMount={onTypeSpecEditorMount}
-                />
-              </Pane>
-              <Pane>
-                <OutputView
-                  compilationState={compilationState}
-                  editorOptions={props.editorOptions}
-                  viewers={props.viewers}
-                  fileViewers={props.emitterViewers?.[selectedEmitter]}
-                />
-              </Pane>
-            </SplitPane>
-          </Pane>
+          <Pane>{mainContent}</Pane>
           <Pane minSize={30}>
             <ProblemPane
               collapsed={verticalPaneSizes[1] === verticalPaneSizesConst.collapsed[1]}

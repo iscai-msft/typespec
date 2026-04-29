@@ -15,7 +15,6 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
     internal class StubLibraryVisitor : ScmLibraryVisitor
     {
         private readonly ValueExpression _throwNull = ThrowExpression(Null);
-        private readonly XmlDocProvider _emptyDocs = new();
 
         protected override TypeProvider? VisitType(TypeProvider type)
         {
@@ -24,7 +23,7 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
                 !type.Name.Equals("MultiPartFormDataBinaryContent", StringComparison.Ordinal))
                 return null;
 
-            type.Update(xmlDocs: _emptyDocs);
+            type.Update(xmlDocs: XmlDocProvider.Empty);
             return type;
         }
 
@@ -46,15 +45,36 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
         {
             if (!IsCallingBaseCtor(constructor) &&
                 !IsEffectivelyPublic(constructor.Signature.Modifiers) &&
+                !IsParameterlessInternalCtorOnMrwSerializationType(constructor) &&
+                !IsInternalClientConstructor(constructor) &&
                 (constructor.EnclosingType is not ModelProvider model || model.DerivedModels.Count == 0))
                 return null;
 
             constructor.Update(
                 bodyStatements: null,
                 bodyExpression: _throwNull,
-                xmlDocs: _emptyDocs);
+                xmlDocs: XmlDocProvider.Empty);
 
             return constructor;
+        }
+
+        private static bool IsInternalClientConstructor(ConstructorProvider constructor)
+        {
+            if (!constructor.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Internal))
+                return false;
+
+            return constructor.EnclosingType is ClientProvider;
+        }
+
+        private static bool IsParameterlessInternalCtorOnMrwSerializationType(ConstructorProvider constructor)
+        {
+            if (constructor.Signature.Parameters.Count != 0)
+                return false;
+
+            if (!constructor.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Internal))
+                return false;
+
+            return constructor.EnclosingType is MrwSerializationTypeDefinition;
         }
 
         private static bool IsCallingBaseCtor(ConstructorProvider constructor)
@@ -67,7 +87,13 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
         protected override FieldProvider? VisitField(FieldProvider field)
         {
             // For ClientOptions, keep the non-public field as this currently represents the latest service version for a client.
-            return (field.Modifiers.HasFlag(FieldModifiers.Public) || field.EnclosingType.Implements.Any(i => i.Equals(typeof(ClientPipelineOptions))))
+            // For ClientProvider, keep const and static fields as they are referenced by stub constructor initializers
+            // (e.g. AuthorizationHeader const used in this() API key ctor, _flows static used in this() OAuth2 ctor).
+            return (field.Modifiers.HasFlag(FieldModifiers.Public)
+                || field.EnclosingType.BaseType?.Equals(typeof(ClientPipelineOptions)) == true
+                || (field.EnclosingType is ClientProvider
+                    && (field.Modifiers.HasFlag(FieldModifiers.Const)
+                        || field.Modifiers.HasFlag(FieldModifiers.Static))))
                 ? field
                 : null;
         }
@@ -82,7 +108,7 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
             method.Update(
                 bodyStatements: null,
                 bodyExpression: _throwNull,
-                xmlDocProvider: _emptyDocs);
+                xmlDocProvider: XmlDocProvider.Empty);
 
             return method;
         }
@@ -96,7 +122,7 @@ namespace Microsoft.TypeSpec.Generator.ClientModel.StubLibrary
 
             property.Update(
                 body: propertyBody,
-                xmlDocs: _emptyDocs);
+                xmlDocs: XmlDocProvider.Empty);
 
             return property;
         }

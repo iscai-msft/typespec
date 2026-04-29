@@ -179,7 +179,7 @@ async function loadOpenApi3PreviewPanel(
         error: "Failed to get generated OpenAPI3 file",
       });
       tel.lastStep = "Get OpenAPI3 output";
-      return ResultCode.Fail;
+      return ResultCode.Cancelled;
     }
 
     const panel = vscode.window.createWebviewPanel(
@@ -283,7 +283,7 @@ async function getOutputFolder(mainTspFile: string, tmpRoot: string): Promise<st
 }
 
 async function clearOutputFolder(outputFolder: string) {
-  let files: string[] = [];
+  let files: string[];
   // Clear the contents of the existing tmpFolder
   try {
     files = await readdir(outputFolder);

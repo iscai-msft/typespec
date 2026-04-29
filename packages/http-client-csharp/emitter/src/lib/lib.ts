@@ -46,13 +46,6 @@ const diags: { [code: string]: DiagnosticDefinition<DiagnosticMessages> } = {
       invalidVersion: paramMessage`The .NET SDK found is version ${"installedVersion"}. Please install the .NET SDK ${"dotnetMajorVersion"} or above and ensure there is no global.json in the file system requesting a lower version. Guidance for installing the .NET SDK can be found at ${"downloadUrl"}.`,
     },
   },
-  "no-root-client": {
-    severity: "error",
-    messages: {
-      default:
-        "Cannot generate CSharp SDK since no public root client is defined in typespec file.",
-    },
-  },
   "unsupported-auth": {
     severity: "warning",
     messages: {
@@ -90,10 +83,22 @@ const diags: { [code: string]: DiagnosticDefinition<DiagnosticMessages> } = {
       default: paramMessage`Cookie parameter is not supported: ${"parameterName"}, found in operation ${"path"}`,
     },
   },
+  "unsupported-parameter-kind": {
+    severity: "warning",
+    messages: {
+      default: paramMessage`Unsupported parameter kind: ${"parameterKind"}.`,
+    },
+  },
   "unsupported-patch-convenience-method": {
     severity: "warning",
     messages: {
       default: paramMessage`Convenience method is not supported for PATCH method, it will be turned off. Please set the '@convenientAPI' to false for operation ${"methodCrossLanguageDefinitionId"}.`,
+    },
+  },
+  "unsupported-service-method": {
+    severity: "warning",
+    messages: {
+      default: paramMessage`Unsupported method kind: ${"methodKind"}.`,
     },
   },
   "unsupported-continuation-location": {
@@ -104,6 +109,10 @@ const diags: { [code: string]: DiagnosticDefinition<DiagnosticMessages> } = {
   },
 };
 
+/**
+ * The TypeSpec library for the C# HTTP client generator.
+ * @beta
+ */
 export const $lib = createTypeSpecLibrary({
   name: "@typespec/http-client-csharp",
   diagnostics: diags,

@@ -7,10 +7,8 @@ import abc
 from enum import Enum
 
 from typing import (
-    Dict,
     Any,
     TYPE_CHECKING,
-    List,
     Optional,
     TypeVar,
     Union,
@@ -35,6 +33,7 @@ class ParameterLocation(str, Enum):
     ENDPOINT_PATH = "endpointPath"
     QUERY = "query"
     BODY = "body"
+    KEYWORD = "keyword"
     OTHER = "other"
 
 
@@ -56,7 +55,7 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
 
     def __init__(
         self,
-        yaml_data: Dict[str, Any],
+        yaml_data: dict[str, Any],
         code_model: "CodeModel",
         type: BaseType,
     ) -> None:
@@ -64,7 +63,7 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
         self.wire_name: str = yaml_data.get("wireName", "")
         self.client_name: str = self.yaml_data["clientName"]
         self.optional: bool = self.yaml_data["optional"]
-        self.implementation: str = yaml_data.get("implementation", None)
+        self.implementation: Optional[str] = yaml_data.get("implementation", None)
         self.location: ParameterLocation = self.yaml_data["location"]
         self.client_default_value = self.yaml_data.get("clientDefaultValue", None)
         self.in_docstring = self.yaml_data.get("inDocstring", True)
@@ -75,12 +74,13 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
         self.grouped_by: Optional[str] = self.yaml_data.get("groupedBy")
         # property matching property name to parameter name for grouping params
         # and flattened body params
-        self.property_to_parameter_name: Optional[Dict[str, str]] = self.yaml_data.get("propertyToParameterName")
+        self.property_to_parameter_name: Optional[dict[str, str]] = self.yaml_data.get("propertyToParameterName")
         self.flattened: bool = self.yaml_data.get("flattened", False)
         self.in_flattened_body: bool = self.yaml_data.get("inFlattenedBody", False)
         self.grouper: bool = self.yaml_data.get("grouper", False)
         self.check_client_input: bool = self.yaml_data.get("checkClientInput", False)
         self.added_on: Optional[str] = self.yaml_data.get("addedOn")
+        self.api_versions: Optional[list[str]] = self.yaml_data.get("apiVersions", [])
         self.is_api_version: bool = self.yaml_data.get("isApiVersion", False)
         self.in_overload: bool = self.yaml_data.get("inOverload", False)
         self.default_to_unset_sentinel: bool = self.yaml_data.get("defaultToUnsetSentinel", False)
@@ -108,19 +108,24 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
         type_description = self.type.description(is_operation_file=True)
         if type_description:
             base_description = add_to_description(base_description, type_description)
-        if self.optional and isinstance(self.type, ConstantType):
+        if (self.optional or self.is_api_version) and isinstance(self.type, ConstantType):
             base_description = add_to_description(
                 base_description,
                 f"Known values are {self.get_declaration()} and None.",
             )
         if not (self.optional or self.client_default_value):
             base_description = add_to_description(base_description, "Required.")
-        if self.client_default_value is not None:
+        if self.is_api_version:
+            base_description = add_to_description(
+                base_description,
+                "Default value is None. If not set, the operation's default API version will be used.",
+            )
+        elif self.client_default_value is not None:
             base_description = add_to_description(
                 base_description,
                 f"Default value is {self.client_default_value_declaration}.",
             )
-        if self.optional and self.client_default_value is None:
+        elif self.optional:
             base_description = add_to_description(
                 base_description,
                 f"Default value is {self.client_default_value_declaration}.",
@@ -159,7 +164,7 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
     def serialization_type(self, **kwargs: Any) -> str:
         return self.type.serialization_type(**kwargs)
 
-    def _imports_shared(self, async_mode: bool, **kwargs: Any) -> FileImport:  # pylint: disable=unused-argument
+    def imports(self, async_mode: bool, **kwargs: Any) -> FileImport:
         file_import = FileImport(self.code_model)
         if self.optional and self.client_default_value is None:
             file_import.add_submodule_import("typing", "Optional", ImportType.STDLIB)
@@ -177,10 +182,6 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
                 ImportType.LOCAL,
                 TypingSection.TYPING,
             )
-        return file_import
-
-    def imports(self, async_mode: bool, **kwargs: Any) -> FileImport:
-        file_import = self._imports_shared(async_mode, **kwargs)
         # special logic for api-version parameter
         if not self.is_api_version:
             file_import.merge(self.type.imports(async_mode=async_mode, **kwargs))
@@ -190,11 +191,6 @@ class _ParameterBase(BaseModel, abc.ABC):  # pylint: disable=too-many-instance-a
                 "_Unset: Any",
                 "object()",
             )
-        return file_import
-
-    def imports_for_multiapi(self, async_mode: bool, **kwargs: Any) -> FileImport:
-        file_import = self._imports_shared(async_mode, **kwargs)
-        file_import.merge(self.type.imports_for_multiapi(async_mode=async_mode, **kwargs))
         return file_import
 
     @property
@@ -226,7 +222,7 @@ class BodyParameter(_ParameterBase):
     """Body parameter."""
 
     @property
-    def entries(self) -> List["BodyParameter"]:
+    def entries(self) -> list["BodyParameter"]:
         return [BodyParameter.from_yaml(e, self.code_model) for e in self.yaml_data.get("entries", [])]
 
     @property
@@ -236,7 +232,7 @@ class BodyParameter(_ParameterBase):
         return (
             self.type.is_form_data
             or bool(self.entries)
-            or ("multipart/form-data" in self.content_types and self.code_model.options["from_typespec"])
+            or ("multipart/form-data" in self.content_types and self.code_model.options["from-typespec"])
         )
 
     @property
@@ -257,7 +253,7 @@ class BodyParameter(_ParameterBase):
         return not (self.flattened or self.grouped_by)
 
     @property
-    def content_types(self) -> List[str]:
+    def content_types(self) -> list[str]:
         return self.yaml_data["contentTypes"]
 
     @property
@@ -275,15 +271,14 @@ class BodyParameter(_ParameterBase):
         if self.is_form_data:
             serialize_namespace = kwargs.get("serialize_namespace", self.code_model.namespace)
             file_import.add_submodule_import(
-                self.code_model.get_relative_import_path(serialize_namespace, module_name="_vendor"),
+                self.code_model.get_relative_import_path(serialize_namespace, module_name="_utils.utils"),
                 "prepare_multipart_form_data",
                 ImportType.LOCAL,
             )
-            file_import.add_submodule_import("typing", "List", ImportType.STDLIB)
         return file_import
 
     @classmethod
-    def from_yaml(cls, yaml_data: Dict[str, Any], code_model: "CodeModel") -> "BodyParameter":
+    def from_yaml(cls, yaml_data: dict[str, Any], code_model: "CodeModel") -> "BodyParameter":
         return cls(
             yaml_data=yaml_data,
             code_model=code_model,
@@ -299,7 +294,7 @@ class Parameter(_ParameterBase):
 
     def __init__(
         self,
-        yaml_data: Dict[str, Any],
+        yaml_data: dict[str, Any],
         code_model: "CodeModel",
         type: BaseType,
     ) -> None:
@@ -313,7 +308,7 @@ class Parameter(_ParameterBase):
 
     @property
     def hide_in_operation_signature(self) -> bool:
-        if self.code_model.options["version_tolerant"] and self.client_name == "maxpagesize":
+        if self.code_model.options["version-tolerant"] and self.client_name == "maxpagesize":
             return True
         return self.is_continuation_token
 
@@ -341,7 +336,7 @@ class Parameter(_ParameterBase):
     ) -> ParameterMethodLocation:
         if not self.in_method_signature:
             raise ValueError(f"Parameter '{self.client_name}' is not in the method.")
-        if self.code_model.options["models_mode"] == "dpg" and self.in_flattened_body:
+        if self.code_model.options["models-mode"] == "dpg" and self.in_flattened_body:
             return ParameterMethodLocation.KEYWORD_ONLY
         if self.grouper:
             return ParameterMethodLocation.POSITIONAL
@@ -355,12 +350,15 @@ class Parameter(_ParameterBase):
             ParameterLocation.HEADER,
             ParameterLocation.QUERY,
         )
-        if self.code_model.options["only_path_and_body_params_positional"] and query_or_header:
+        if self.code_model.options["only-path-and-body-params-positional"] and query_or_header:
+            return ParameterMethodLocation.KEYWORD_ONLY
+        # for optional path parameter, we need to use keyword only
+        if self.location == ParameterLocation.PATH and self.optional:
             return ParameterMethodLocation.KEYWORD_ONLY
         return ParameterMethodLocation.POSITIONAL
 
     @classmethod
-    def from_yaml(cls, yaml_data: Dict[str, Any], code_model: "CodeModel"):
+    def from_yaml(cls, yaml_data: dict[str, Any], code_model: "CodeModel"):
         return cls(
             yaml_data=yaml_data,
             code_model=code_model,
@@ -381,16 +379,18 @@ class ClientParameter(Parameter):
             return ParameterMethodLocation.KWARG
         if (
             self.is_host
-            and (self.code_model.options["version_tolerant"] or self.code_model.options["low_level_client"])
-            and not self.code_model.options["azure_arm"]
+            and (self.code_model.options["version-tolerant"] or self.code_model.options["low-level-client"])
+            and not self.code_model.options["azure-arm"]
         ):
             # this means i am the base url
             return ParameterMethodLocation.KEYWORD_ONLY
         if (
             self.client_default_value is not None
-            and self.code_model.options["from_typespec"]
-            and not self.code_model.options["azure_arm"]
+            and self.code_model.options["from-typespec"]
+            and not self.code_model.options["azure-arm"]
         ):
+            return ParameterMethodLocation.KEYWORD_ONLY
+        if self.location == ParameterLocation.KEYWORD:
             return ParameterMethodLocation.KEYWORD_ONLY
         return ParameterMethodLocation.POSITIONAL
 

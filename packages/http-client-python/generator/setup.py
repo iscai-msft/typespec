@@ -47,11 +47,11 @@ setup(
         ]
     ),
     install_requires=[
-        "black==24.8.0",
+        "black==26.3.1",
         "docutils>=0.20.1",
         "Jinja2==3.1.6",
         "PyYAML==6.0.1",
         "tomli==2.0.1",
-        "setuptools==70.0.0",
+        "setuptools==75.3.2",
     ],
 )

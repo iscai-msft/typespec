@@ -12,21 +12,25 @@ from subprocess import check_call, CalledProcessError
 import os
 import logging
 import sys
-from util import run_check
+from util import run_check, get_package_namespace_dir
 
 logging.getLogger().setLevel(logging.INFO)
 
 
 def get_config_file_location():
-    mypy_ini_path = os.path.join(os.getcwd(), "../../eng/scripts/ci/mypy.ini")
+    # When running from tests/ directory via tox
+    mypy_ini_path = os.path.join(os.getcwd(), "../eng/scripts/ci/config/mypy.ini")
     if os.path.exists(mypy_ini_path):
         return mypy_ini_path
-    else:
-        return os.path.join(os.getcwd(), "../../../eng/scripts/ci/mypy.ini")
+    # Fallback for running from different directories
+    return os.path.join(os.path.dirname(__file__), "config/mypy.ini")
 
 
 def _single_dir_mypy(mod):
-    inner_class = next(d for d in mod.iterdir() if d.is_dir() and not str(d).endswith("egg-info"))
+    inner_class = get_package_namespace_dir(mod)
+    if not inner_class:
+        logging.info(f"No package directory found in {mod}, skipping")
+        return True
     try:
         check_call(
             [

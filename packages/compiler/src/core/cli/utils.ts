@@ -1,5 +1,3 @@
-// NOTE: We could also use { shell: true } to let windows find the .cmd, but that breaks
-
 import { SpawnSyncOptionsWithStringEncoding, spawnSync } from "child_process";
 import pc from "picocolors";
 import { inspect } from "util";
@@ -7,6 +5,7 @@ import { logDiagnostics } from "../diagnostics.js";
 import { Colors, ExternalError } from "../external-error.js";
 import { createConsoleSink } from "../logger/console-sink.js";
 import { createLogger } from "../logger/logger.js";
+import { createTracer } from "../logger/tracer.js";
 import { NodeHost } from "../node-host.js";
 import { getBaseFileName } from "../path-utils.js";
 import { Diagnostic } from "../types.js";
@@ -25,6 +24,7 @@ export interface RunOptions extends Partial<SpawnSyncOptionsWithStringEncoding> 
 export interface CliHostArgs {
   pretty?: boolean;
   debug?: boolean;
+  trace?: string[];
 }
 
 export function withCliHost<T extends CliHostArgs>(
@@ -71,8 +71,12 @@ export function createCLICompilerHost(options: CliHostArgs): CliCompilerHost {
     pathRelativeTo: process.cwd(),
     trackAction: true,
   });
-  const logger = createLogger({ sink: logSink, level: options.debug ? "trace" : "warning" });
-  return { ...NodeHost, logSink, logger, debug: options.debug ?? false };
+  const logger = createLogger({ sink: logSink });
+  const tracer = createTracer(logger, {
+    filter: options.trace ?? (options.debug ? ["*"] : undefined),
+  });
+  tracer.trace("cli.args", `CLI args: ${inspect(options, { depth: null })}`);
+  return { ...NodeHost, logSink, logger, tracer, debug: options.debug ?? false };
 }
 
 export function run(
@@ -188,4 +192,22 @@ export function handleInternalCompilerError(error: unknown): never {
 
 function color(text: string, color: Colors) {
   return pc[color](text);
+}
+
+/**
+ * Parses the `key=value` pairs from the `--arg` or `--args` CLI option.
+ * @param args The array of args passed to the CLI via --arg/--args.
+ */
+export function parseCliArgsArgOption(args: string[] = []): Record<string, string> {
+  const map: Record<string, string> = {};
+  for (const arg of args) {
+    const optionParts = arg.split("=");
+    if (optionParts.length !== 2) {
+      throw new Error(`The --arg parameter value "${arg}" must be in the format: arg-name=value`);
+    }
+
+    map[optionParts[0]] = optionParts[1];
+  }
+
+  return map;
 }

@@ -3,8 +3,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Data.Common;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
+using System.Reflection.Metadata;
 using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.TypeSpec.Generator.Expressions;
@@ -12,6 +15,7 @@ using Microsoft.TypeSpec.Generator.Primitives;
 using Microsoft.TypeSpec.Generator.Providers;
 using Microsoft.TypeSpec.Generator.Snippets;
 using Microsoft.TypeSpec.Generator.Statements;
+using Microsoft.TypeSpec.Generator.Utilities;
 using static Microsoft.TypeSpec.Generator.Snippets.Snippet;
 
 namespace Microsoft.TypeSpec.Generator
@@ -29,7 +33,6 @@ namespace Microsoft.TypeSpec.Generator
         private bool _atBeginningOfLine;
         private bool _writingXmlDocumentation;
         private bool _writingNewInstance;
-
         internal CodeWriter()
         {
             _builder = new UnsafeBufferSequence(1024);
@@ -184,17 +187,41 @@ namespace Microsoft.TypeSpec.Generator
             {
                 if (method.BodyStatements is { } body)
                 {
+                    foreach (var suppression in method.Suppressions)
+                    {
+                        suppression.DisableStatement.Write(this);
+                    }
                     using (WriteMethodDeclaration(method.Signature))
                     {
                         body.Write(this);
                     }
+                    foreach (var suppression in method.Suppressions)
+                    {
+                        suppression.RestoreStatement.Write(this);
+                    }
                 }
                 else if (method.BodyExpression is { } expression)
                 {
+                    foreach (var suppression in method.Suppressions)
+                    {
+                        suppression.DisableStatement.Write(this);
+                    }
                     using (WriteMethodDeclarationNoScope(method.Signature))
                     {
                         AppendRaw(" => ");
                         expression.Write(this);
+                        WriteRawLine(";");
+                    }
+                    foreach (var suppression in method.Suppressions)
+                    {
+                        suppression.RestoreStatement.Write(this);
+                    }
+                }
+                else if (method.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Partial)
+                    || method.Signature.Modifiers.HasFlag(MethodSignatureModifiers.Abstract))
+                {
+                    using (WriteMethodDeclarationNoScope(method.Signature))
+                    {
                         WriteRawLine(";");
                     }
                 }
@@ -209,18 +236,38 @@ namespace Microsoft.TypeSpec.Generator
             {
                 if (ctor.BodyStatements is { } body)
                 {
+                    foreach (var suppression in ctor.Suppressions)
+                    {
+                        suppression.DisableStatement.Write(this);
+                    }
+
                     using (WriteMethodDeclaration(ctor.Signature))
                     {
                         body.Write(this);
                     }
+
+                    foreach (var suppression in ctor.Suppressions)
+                    {
+                        suppression.RestoreStatement.Write(this);
+                    }
                 }
                 else if (ctor.BodyExpression is { } expression)
                 {
+                    foreach (var suppression in ctor.Suppressions)
+                    {
+                        suppression.DisableStatement.Write(this);
+                    }
+
                     using (WriteMethodDeclarationNoScope(ctor.Signature))
                     {
                         AppendRaw(" => ");
                         expression.Write(this);
                         WriteRawLine(";");
+                    }
+
+                    foreach (var suppression in ctor.Suppressions)
+                    {
+                        suppression.RestoreStatement.Write(this);
                     }
                 }
             }
@@ -254,7 +301,7 @@ namespace Microsoft.TypeSpec.Generator
                 docs.Summary.Write(this);
             }
 
-            foreach (var param in docs.Params)
+            foreach (var param in docs.Parameters)
             {
                 param.Write(this);
             }
@@ -274,6 +321,14 @@ namespace Microsoft.TypeSpec.Generator
         {
             WriteXmlDocsNoScope(property.XmlDocs);
 
+            if (property.Attributes.Count > 0)
+            {
+                foreach (var attr in property.Attributes)
+                {
+                    attr.Write(this);
+                }
+            }
+
             CodeScope? indexerScope = null;
 
             var modifiers = property.Modifiers;
@@ -286,6 +341,8 @@ namespace Microsoft.TypeSpec.Generator
                 .AppendRawIf("static ", modifiers.HasFlag(MethodSignatureModifiers.Static))
                 .AppendRawIf("virtual ", modifiers.HasFlag(MethodSignatureModifiers.Virtual));
 
+            AppendRawIf("ref ", property.IsRef);
+
             Append($"{property.Type} ");
 
             if (property.ExplicitInterface is not null)
@@ -295,7 +352,7 @@ namespace Microsoft.TypeSpec.Generator
             if (property is IndexPropertyProvider indexer)
             {
                 indexerScope = AmbientScope();
-                Append($"{indexer.Name}[{indexer.IndexerParameter.Type} {indexer.IndexerParameter.AsExpression().Declaration}]");
+                Append($"{indexer.Name}[{indexer.IndexerParameter.Type} {indexer.IndexerParameter.AsVariable().Declaration}]");
             }
             else
             {
@@ -418,10 +475,11 @@ namespace Microsoft.TypeSpec.Generator
             }
 
             AppendRawIf("out ", parameter.IsOut);
+            AppendRawIf("in ", parameter.IsIn);
             AppendRawIf("ref ", parameter.IsRef);
             AppendRawIf("params ", parameter.IsParams);
 
-            Append($"{parameter.Type} {parameter.AsExpression().Declaration}");
+            Append($"{parameter.Type} {parameter.AsVariable().Declaration}");
             if (parameter.DefaultValue != null)
             {
                 AppendRaw(" = ");
@@ -432,6 +490,14 @@ namespace Microsoft.TypeSpec.Generator
         public CodeWriter WriteField(FieldProvider field)
         {
             WriteXmlDocsNoScope(field.XmlDocs);
+
+            if (field.Attributes.Count > 0)
+            {
+                foreach (var attr in field.Attributes)
+                {
+                    attr.Write(this);
+                }
+            }
 
             var modifiers = field.Modifiers;
 
@@ -450,8 +516,7 @@ namespace Microsoft.TypeSpec.Generator
                 Append($"{field.Type} {field.Declaration:D}");
             }
 
-            if (field.InitializationValue != null &&
-                (modifiers.HasFlag(FieldModifiers.Const) || modifiers.HasFlag(FieldModifiers.Static)))
+            if (field.InitializationValue != null)
             {
                 AppendRaw(" = ");
                 field.InitializationValue.Write(this);
@@ -563,11 +628,11 @@ namespace Microsoft.TypeSpec.Generator
             }
         }
 
-        private void AppendType(CSharpType type, bool isDeclaration, bool writeTypeNameOnly)
+        private void AppendType(CSharpType type, bool isDeclaration, bool writeTypeNameOnly, int genericDepth = 0)
         {
             if (type.IsArray && type.FrameworkType.GetGenericArguments().Any())
             {
-                AppendType(type.FrameworkType.GetElementType()!, isDeclaration, writeTypeNameOnly);
+                AppendType(type.FrameworkType.GetElementType()!, isDeclaration, writeTypeNameOnly, genericDepth);
                 AppendRaw("[]");
                 return;
             }
@@ -605,7 +670,7 @@ namespace Microsoft.TypeSpec.Generator
                 AppendRaw(_writingXmlDocumentation ? "{" : "<");
                 for (int i = 0; i < type.Arguments.Count; i++)
                 {
-                    AppendType(type.Arguments[i], false, writeTypeNameOnly);
+                    AppendType(type.Arguments[i], false, writeTypeNameOnly, genericDepth + 1);
                     if (i != type.Arguments.Count - 1)
                     {
                         AppendRaw(_writingXmlDocumentation ? "," : ", ");
@@ -614,7 +679,8 @@ namespace Microsoft.TypeSpec.Generator
                 AppendRaw(_writingXmlDocumentation ? "}" : ">");
             }
 
-            if (!_writingNewInstance && !isDeclaration && type is { IsNullable: true, IsValueType: true })
+            // Add '?' for nullable value types, but skip if we're writing new instance UNLESS we're inside generic type arguments
+            if ((!_writingNewInstance || genericDepth > 0) && !isDeclaration && type is { IsNullable: true, IsValueType: true })
             {
                 AppendRaw("?");
             }
@@ -728,6 +794,11 @@ namespace Microsoft.TypeSpec.Generator
 
         public IDisposable WriteMethodDeclarationNoScope(MethodSignatureBase methodBase, params string[] disabledWarnings)
         {
+            if (methodBase.NonDocumentComment is { } comment)
+            {
+                WriteLine($"// {comment}");
+            }
+
             foreach (var attribute in methodBase.Attributes)
             {
                 attribute.Write(this);
@@ -742,16 +813,19 @@ namespace Microsoft.TypeSpec.Generator
                 .AppendRawIf("private ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Private))
                 .AppendRawIf("protected ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Protected))
                 .AppendRawIf("internal ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Internal))
-                .AppendRawIf("static ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Static));
+                .AppendRawIf("static ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Static))
+                .AppendRawIf("partial ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Partial));
 
             if (methodBase is MethodSignature method)
             {
                 AppendRawIf("virtual ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Virtual))
+                    .AppendRawIf("abstract ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Abstract))
                     .AppendRawIf("override ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Override))
                     .AppendRawIf("new ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.New))
                     .AppendRawIf("async ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Async));
 
-                var isImplicitOrExplicit = methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Implicit) || methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Explicit);
+                var isImplicit = methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Implicit);
+                var isImplicitOrExplicit = isImplicit || methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Explicit);
                 if (!isImplicitOrExplicit)
                 {
                     if (method.ReturnType != null)
@@ -768,17 +842,21 @@ namespace Microsoft.TypeSpec.Generator
                     .AppendRawIf("explicit ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Explicit))
                     .AppendRawIf("operator ", methodBase.Modifiers.HasFlag(MethodSignatureModifiers.Operator));
 
-                if (isImplicitOrExplicit)
-                {
-                    AppendIf($"{method.ReturnType}", method.ReturnType is not null);
-                }
-
                 if (method.ExplicitInterface is not null)
                 {
                     Append($"{method.ExplicitInterface}.");
                 }
 
-                Append($"{methodBase.Name}");
+                if (isImplicit)
+                {
+                    // Implicit operator method name is just the return type.
+                    // But we need to include the actual CSharpType so that the correct namespace using gets written.
+                    AppendIf($"{method.ReturnType}", method.ReturnType is not null);
+                }
+                else
+                {
+                    Append($"{methodBase.Name}");
+                }
 
                 if (method?.GenericArguments != null)
                 {
@@ -818,10 +896,14 @@ namespace Microsoft.TypeSpec.Generator
             {
                 using (ScopeRaw(string.Empty, string.Empty, false))
                 {
-                    foreach (var constraint in constraints)
+                    for (int i = 0; i < constraints.Count; i++)
                     {
+                        var constraint = constraints[i];
                         constraint.Write(this);
-                        AppendRaw(" ");
+                        if (i < constraints.Count - 1)
+                        {
+                            AppendRaw(" ");
+                        }
                     }
                 }
             }
@@ -922,11 +1004,15 @@ namespace Microsoft.TypeSpec.Generator
             return codeWriterScope;
         }
 
-        internal void Append(CodeWriterDeclaration declaration)
+        internal void Append(CodeWriterDeclaration declaration, bool referenceOnly = false)
         {
             if (declaration.HasBeenDeclared(_scopes))
             {
                 WriteIdentifier(declaration.GetActualName(_scopes.Peek()));
+            }
+            else if (referenceOnly)
+            {
+                WriteIdentifier(declaration.RequestedName);
             }
             else
             {

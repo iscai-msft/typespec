@@ -43,7 +43,7 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
         reportDiagnostic(program, {
           code: "unknown-error",
           format: {
-            errorMessage: `The emitter was unable to generate client code from this TypeSpec, please open an issue on https://github.com/microsoft/typespec, include TypeSpec source and all the diagnostic information in your submission.\nStack: error.stack`,
+            errorMessage: `Error occurred when building the code model. The emitter was unable to generate client code from this TypeSpec, please open an issue on https://github.com/microsoft/typespec, include TypeSpec source and all the diagnostic information in your submission.\nStack: ${error.stack}\nError: ${error.toString()}`,
           },
           target: NoTarget,
         });
@@ -103,6 +103,24 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
       if (options["dev-options"]?.["java-temp-dir"]) {
         javaArgs.push("-Dcodegen.java.temp.directory=" + options["dev-options"]?.["java-temp-dir"]);
       }
+      if (options["dev-options"]?.profile) {
+        const perfProfile = resolvePath(
+          moduleRoot,
+          "generator/http-client-generator/target/classes",
+          "PerfAutomation.jfc",
+        );
+        javaArgs.push("-XX:+FlightRecorder");
+        javaArgs.push(
+          `-XX:StartFlightRecording=settings="${perfProfile}",filename="${options["output-dir"]}/typespecPerf.jfr",maxsize=1gb`,
+        );
+      }
+      // These module modifications are needed by google-java-format
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED");
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED");
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED");
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED");
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED");
+      javaArgs.push("--add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED");
       javaArgs.push("-jar");
       javaArgs.push(jarFileName);
       javaArgs.push(codeModelFileName);
@@ -126,7 +144,7 @@ export async function $onEmit(context: EmitContext<EmitterOptions>) {
           reportDiagnostic(program, {
             code: "unknown-error",
             format: {
-              errorMessage: `The emitter was unable to generate client code from this TypeSpec, please open an issue on https://github.com/microsoft/typespec, include TypeSpec source and all the diagnostic information in your submission.`,
+              errorMessage: `Error occurred while running Java generator. The emitter was unable to generate client code from this TypeSpec, please open an issue on https://github.com/microsoft/typespec, include TypeSpec source and all the diagnostic information in your submission. ${error.stack}\nError: ${error.toString()}`,
             },
             target: NoTarget,
           });
@@ -167,20 +185,23 @@ function reportJarOutput(program: Program, jarOutput: string) {
   }
 
   // trace or report the logs, according to log level
+  const typeSpecPluginPrefix = "com.microsoft.typespec.http.client.generator.";
+  const errorPrefix = "ERROR " + typeSpecPluginPrefix;
+  const warnPrefix = "WARN " + typeSpecPluginPrefix;
   for (const log of logs) {
-    if (log.startsWith("ERROR ")) {
+    if (log.startsWith(errorPrefix)) {
       reportDiagnostic(program, {
         code: "generator-error",
         format: {
-          errorMessage: log.substring(6),
+          errorMessage: log.substring(errorPrefix.length),
         },
         target: NoTarget,
       });
-    } else if (log.startsWith("WARN ")) {
+    } else if (log.startsWith(warnPrefix)) {
       reportDiagnostic(program, {
         code: "generator-warning",
         format: {
-          warningMessage: log.substring(5),
+          warningMessage: log.substring(warnPrefix.length),
         },
         target: NoTarget,
       });

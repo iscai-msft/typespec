@@ -9,10 +9,12 @@ import {
   isArrayModelType,
   isRecordModelType,
 } from "@typespec/compiler";
+import { $ } from "@typespec/compiler/typekit";
 import {
   HttpOperation,
   HttpOperationParameter,
   getHeaderFieldName,
+  getHttpOperation,
   isBody,
   isHeader,
   isStatusCode,
@@ -25,7 +27,7 @@ import {
   requireSerialization,
 } from "../../common/serialization/index.js";
 import { Module, completePendingDeclarations, createModule } from "../../ctx.js";
-import { isUnspeakable, parseCase } from "../../util/case.js";
+import { ReCase, isUnspeakable, parseCase } from "../../util/case.js";
 import { UnimplementedError } from "../../util/error.js";
 import { getAllProperties } from "../../util/extends.js";
 import { bifilter, indent } from "../../util/iter.js";
@@ -40,7 +42,13 @@ import { emitMultipart, emitMultipartLegacy } from "./multipart.js";
 import { module as headerHelpers } from "../../../generated-defs/helpers/header.js";
 import { module as httpHelpers } from "../../../generated-defs/helpers/http.js";
 import { getJsScalar } from "../../common/scalar.js";
-import { requiresJsonSerialization } from "../../common/serialization/json.js";
+import {
+  requiresJsonSerialization,
+  transposeExpressionFromJson,
+  transposeExpressionToJson,
+} from "../../common/serialization/json.js";
+import { getFullyQualifiedTypeName } from "../../util/name.js";
+import { canonicalizeHttpOperation } from "../operation.js";
 
 const DEFAULT_CONTENT_TYPE = "application/json";
 
@@ -91,11 +99,14 @@ function* emitRawServerOperation(
   module: Module,
   responderNames: Pick<Names, "isHttpResponder" | "httpResponderSym">,
 ): Iterable<string> {
-  const op = operation.operation;
+  let op = operation.operation;
   const operationNameCase = parseCase(op.name);
 
   const container = op.interface ?? op.namespace!;
   const containerNameCase = parseCase(container.name);
+
+  op = canonicalizeHttpOperation(ctx, op);
+  [operation] = getHttpOperation(ctx.program, op);
 
   module.imports.push({
     binder: [containerNameCase.pascalCase],
@@ -198,9 +209,12 @@ function* emitRawServerOperation(
     const bodyTypeName = emitTypeReference(
       ctx,
       body.type,
-      body.property?.type ?? operation.operation.node,
+      body.property?.type ?? operation.operation,
       module,
-      { altName: defaultBodyTypeName },
+      {
+        altName: defaultBodyTypeName,
+        requireDeclaration: requiresJsonSerialization(ctx, module, body.type),
+      },
     );
 
     bodyName = ctx.gensym(bodyNameCase.camelCase);
@@ -236,14 +250,7 @@ function* emitRawServerOperation(
         let value: string;
 
         if (requiresJsonSerialization(ctx, module, body.type)) {
-          if (body.type.kind === "Model" && isArrayModelType(ctx.program, body.type)) {
-            const innerTypeName = emitTypeReference(
-              ctx,
-              body.type.indexer.value,
-              body.type,
-              module,
-              { requireDeclaration: true },
-            );
+          if (body.type.kind === "Model" && isArrayModelType(body.type)) {
             yield `        const __arrayBody = JSON.parse(body);`;
             yield `        if (!Array.isArray(__arrayBody)) {`;
             yield `          ${names.ctx}.errorHandlers.onInvalidRequest(`;
@@ -253,16 +260,8 @@ function* emitRawServerOperation(
             yield `          );`;
             yield `          return reject();`;
             yield `        }`;
-            value = `__arrayBody.map((item) => ${innerTypeName}.fromJsonObject(JSON.parse(item)))`;
-          } else if (body.type.kind === "Model" && isRecordModelType(ctx.program, body.type)) {
-            const innerTypeName = emitTypeReference(
-              ctx,
-              body.type.indexer.value,
-              body.type,
-              module,
-              { requireDeclaration: true },
-            );
-
+            value = transposeExpressionFromJson(ctx, body.type, `__arrayBody`, module);
+          } else if (body.type.kind === "Model" && isRecordModelType(body.type)) {
             yield `        const __recordBody = JSON.parse(body);`;
             yield `        if (typeof __recordBody !== "object" || __recordBody === null) {`;
             yield `          ${names.ctx}.errorHandlers.onInvalidRequest(`;
@@ -272,9 +271,11 @@ function* emitRawServerOperation(
             yield `          );`;
             yield `          return reject();`;
             yield `        }`;
-            value = `Object.fromEntries(Object.entries(__recordBody).map(([key, value]) => [key, ${innerTypeName}.fromJsonObject(value)]))`;
+            value = transposeExpressionFromJson(ctx, body.type, `__recordBody`, module);
+          } else if (body.type.kind === "Scalar") {
+            value = transposeExpressionFromJson(ctx, body.type, `JSON.parse(body)`, module);
           } else {
-            value = `${bodyTypeName}.fromJsonObject(JSON.parse(body))`;
+            value = `${bodyTypeName}.fromJsonObject(globalThis.JSON.parse(body))`;
           }
         } else {
           value = `JSON.parse(body)`;
@@ -296,7 +297,7 @@ function* emitRawServerOperation(
 
         break;
       }
-      case "multipart/form-data":
+      case "multipart/form-data": {
         if (body.bodyKind === "multipart") {
           yield* indent(
             emitMultipart(ctx, module, operation, body, names.ctx, bodyName, bodyTypeName),
@@ -305,7 +306,88 @@ function* emitRawServerOperation(
           yield* indent(emitMultipartLegacy(names.ctx, bodyName, bodyTypeName));
         }
         break;
+      }
+      case "text/plain": {
+        const string = ctx.program.checker.getStdType("string");
+        const assignable = $(ctx.program).type.isAssignableTo(
+          body.type,
+          string,
+          body.property ?? body.type,
+        );
+        if (!assignable) {
+          const name =
+            ("namespace" in body.type &&
+              body.type.namespace &&
+              getFullyQualifiedTypeName(body.type)) ||
+            ("name" in body.type && typeof body.type.name === "string" && body.type.name) ||
+            "<unknown>";
+          reportDiagnostic(ctx.program, {
+            code: "unrecognized-media-type",
+            target: body.property ?? body.type,
+            format: {
+              mediaType: contentType,
+              type: name,
+            },
+          });
+        }
+
+        yield `  const ${bodyName} = await new Promise(function parse${bodyNameCase.pascalCase}(resolve, reject) {`;
+        yield `    const chunks: Array<Buffer> = [];`;
+        yield `    ${names.ctx}.request.on("data", function appendChunk(chunk) { chunks.push(chunk); });`;
+        yield `    ${names.ctx}.request.on("end", function finalize() {`;
+        yield `      try {`;
+        yield `        const body = Buffer.concat(chunks).toString();`;
+        yield `        resolve(body);`;
+        yield `      } catch (e) {`;
+        yield `        ${names.ctx}.errorHandlers.onInvalidRequest(`;
+        yield `          ${names.ctx},`;
+        yield `          ${JSON.stringify(operation.path)},`;
+        yield `          "invalid text in request body",`;
+        yield `        );`;
+        yield `        reject(e);`;
+        yield `      }`;
+        yield `    });`;
+        yield `    ${names.ctx}.request.on("error", reject);`;
+        yield `  }) as string;`;
+        yield "";
+        break;
+      }
+      case "application/octet-stream":
       default:
+        {
+          if (!ctx.program.checker.isStdType(body.type, "bytes")) {
+            const name =
+              ("namespace" in body.type &&
+                body.type.namespace &&
+                getFullyQualifiedTypeName(body.type)) ||
+              ("name" in body.type && typeof body.type.name === "string" && body.type.name) ||
+              "<unknown>";
+
+            reportDiagnostic(ctx.program, {
+              code: "unrecognized-media-type",
+              target: body.property ?? body.type,
+              format: {
+                mediaType: contentType,
+                type: name,
+              },
+            });
+          }
+          yield `  const ${bodyName} = await new Promise(function parse${bodyNameCase.pascalCase}(resolve, reject) {`;
+          yield `    const chunks: Array<Buffer> = [];`;
+          yield `    ${names.ctx}.request.on("data", function appendChunk(chunk) { chunks.push(chunk); });`;
+          yield `    ${names.ctx}.request.on("end", function finalize() {`;
+          yield `      try {`;
+          yield `        const body = Buffer.concat(chunks);`;
+          yield `        resolve(body);`;
+          yield `      } catch (e) {`;
+          yield `        reject(e);`;
+          yield `      }`;
+          yield `    });`;
+          yield `    ${names.ctx}.request.on("error", reject);`;
+          yield `  }) as Buffer;`;
+          yield "";
+          break;
+        }
         throw new UnimplementedError(`request deserialization for content-type: '${contentType}'`);
     }
 
@@ -323,7 +405,13 @@ function* emitRawServerOperation(
     const paramNameSafe = keywordSafe(paramNameCase.camelCase);
     const isBodyField = bodyFields.has(param.name) && bodyFields.get(param.name) === param.type;
     const isBodyExact = operation.parameters.body?.property === param;
-    if (isBodyField) {
+    const isPathParameter = operation.parameters.parameters.some(
+      (p) => p.type === "path" && p.param === param,
+    );
+
+    if (isPathParameter) {
+      paramBaseExpression = `${paramNameSafe}`;
+    } else if (isBodyField) {
       paramBaseExpression = `${bodyName}.${paramNameCase.camelCase}`;
     } else if (isBodyExact) {
       paramBaseExpression = bodyName!;
@@ -337,7 +425,11 @@ function* emitRawServerOperation(
 
         const encoder = jsScalar.http[httpOperationParam.type];
 
-        paramBaseExpression = encoder.decode(paramNameSafe);
+        const decoded = encoder.decode(paramNameSafe);
+
+        paramBaseExpression = param.optional
+          ? `${paramNameSafe} === undefined ? undefined : (${decoded})`
+          : decoded;
       } else {
         paramBaseExpression = paramNameSafe;
       }
@@ -376,7 +468,9 @@ function* emitRawServerOperation(
   yield `  }`;
   yield "";
 
-  yield* indent(emitResultProcessing(ctx, names, op.returnType, module));
+  yield* indent(
+    emitResultProcessing(ctx, createNamer(operationNameCase), names, op.returnType, module),
+  );
 
   yield "}";
 
@@ -392,6 +486,29 @@ interface Names {
   httpResponderSym: string;
 }
 
+interface Namer {
+  opName: ReCase;
+
+  names: Record<string, number>;
+
+  getAltName(name: string): string;
+}
+
+function createNamer(opName: ReCase): Namer {
+  const names: Record<string, number> = {};
+
+  return {
+    opName,
+    names,
+    getAltName(name: string): string {
+      names[name] ??= 1;
+      const idx = names[name]++;
+
+      return this.opName.pascalCase + (idx === 1 ? name : `${name}_${idx}`);
+    },
+  };
+}
+
 /**
  * Emit the result-processing code for an operation.
  *
@@ -403,13 +520,14 @@ interface Names {
  */
 function* emitResultProcessing(
   ctx: HttpContext,
+  namer: Namer,
   names: Names,
   t: Type,
   module: Module,
 ): Iterable<string> {
   if (t.kind !== "Union") {
     // Single target type
-    yield* emitResultProcessingForType(ctx, names, t, module);
+    yield* emitResultProcessingForType(ctx, namer, names, t, module);
   } else {
     const codeTree = differentiateUnion(ctx, module, t);
 
@@ -419,7 +537,7 @@ function* emitResultProcessing(
         return names.result + "." + parseCase(p.name).camelCase;
       },
       // We mapped the output directly in the code tree input, so we can just return it.
-      renderResult: (t) => emitResultProcessingForType(ctx, names, t, module),
+      renderResult: (t) => emitResultProcessingForType(ctx, namer, names, t, module),
     });
   }
 }
@@ -433,6 +551,7 @@ function* emitResultProcessing(
  */
 function* emitResultProcessingForType(
   ctx: HttpContext,
+  namer: Namer,
   names: Names,
   target: Type,
   module: Module,
@@ -451,7 +570,7 @@ function* emitResultProcessingForType(
       case "unknown":
         yield `${names.ctx}.response.statusCode = 200;`;
         yield `${names.ctx}.response.setHeader("content-type", "application/json");`;
-        yield `${names.ctx}.response.end(JSON.stringify(${names.result}));`;
+        yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}));`;
         return;
       case "never":
         yield `return ${names.ctx}.errorHandlers.onInternalError(${names.ctx}, "Internal server error.");`;
@@ -459,6 +578,25 @@ function* emitResultProcessingForType(
       default:
         throw new UnimplementedError(`result processing for intrinsic type '${target.name}'`);
     }
+  }
+
+  if (target.kind === "Scalar" || isValueLiteralType(target)) {
+    const serializationRequired =
+      target.kind === "Scalar" && isSerializationRequired(ctx, module, target, "application/json");
+
+    if (target.kind === "Scalar") {
+      requireSerialization(ctx, target, "application/json");
+    }
+
+    yield `${names.ctx}.response.setHeader("content-type", "application/json");`;
+
+    if (serializationRequired) {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${transposeExpressionToJson(ctx, target, names.result, module)}));`;
+    } else {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}));`;
+    }
+
+    return;
   }
 
   if (target.kind !== "Model") {
@@ -515,11 +653,48 @@ function* emitResultProcessingForType(
 
     if (serializationRequired) {
       const typeReference = emitTypeReference(ctx, body.type, body, module, {
+        altName: namer.getAltName("Body"),
         requireDeclaration: true,
       });
-      yield `${names.ctx}.response.end(JSON.stringify(${typeReference}.toJsonObject(${names.result}.${bodyCase.camelCase})))`;
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${typeReference}.toJsonObject(${names.result}.${bodyCase.camelCase})))`;
     } else {
-      yield `${names.ctx}.response.end(JSON.stringify(${names.result}.${bodyCase.camelCase}));`;
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}.${bodyCase.camelCase}));`;
+    }
+  } else if (isArrayModelType(target)) {
+    const itemType = target.indexer.value;
+
+    const serializationRequired = isSerializationRequired(
+      ctx,
+      module,
+      itemType,
+      "application/json",
+    );
+    requireSerialization(ctx, itemType, "application/json");
+
+    yield `${names.ctx}.response.setHeader("content-type", "application/json");`;
+
+    if (serializationRequired) {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${transposeExpressionToJson(ctx, target, names.result, module)}));`;
+    } else {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}));`;
+    }
+  } else if (isRecordModelType(target)) {
+    const itemType = target.indexer.value;
+
+    const serializationRequired = isSerializationRequired(
+      ctx,
+      module,
+      itemType,
+      "application/json",
+    );
+    requireSerialization(ctx, itemType, "application/json");
+
+    yield `${names.ctx}.response.setHeader("content-type", "application/json");`;
+
+    if (serializationRequired) {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${transposeExpressionToJson(ctx, target, names.result, module)}));`;
+    } else {
+      yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}));`;
     }
   } else {
     if (allMetadataIsRemoved) {
@@ -537,11 +712,12 @@ function* emitResultProcessingForType(
 
       if (serializationRequired) {
         const typeReference = emitTypeReference(ctx, target, target, module, {
+          altName: namer.getAltName("Result"),
           requireDeclaration: true,
         });
-        yield `${names.ctx}.response.end(JSON.stringify(${typeReference}.toJsonObject(${names.result} as ${typeReference})));`;
+        yield `${names.ctx}.response.end(globalThis.JSON.stringify(${typeReference}.toJsonObject(${names.result} as ${typeReference})));`;
       } else {
-        yield `${names.ctx}.response.end(JSON.stringify(${names.result}));`;
+        yield `${names.ctx}.response.end(globalThis.JSON.stringify(${names.result}));`;
       }
     }
   }

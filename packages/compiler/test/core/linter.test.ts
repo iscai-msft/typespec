@@ -2,12 +2,14 @@ import { describe, it } from "vitest";
 
 import { createLinterRule, createTypeSpecLibrary } from "../../src/core/library.js";
 import { Linter, createLinter, resolveLinterDefinition } from "../../src/core/linter.js";
-import type { LibraryInstance, LinterDefinition } from "../../src/index.js";
 import {
-  createTestHost,
-  expectDiagnosticEmpty,
-  expectDiagnostics,
-} from "../../src/testing/index.js";
+  type Interface,
+  type LibraryInstance,
+  type LinterDefinition,
+  type LinterRuleContext,
+} from "../../src/index.js";
+import { expectDiagnosticEmpty, expectDiagnostics, mockFile } from "../../src/testing/index.js";
+import { Tester } from "../tester.js";
 
 const noModelFoo = createLinterRule({
   name: "no-model-foo",
@@ -29,18 +31,82 @@ const noModelFoo = createLinterRule({
   },
 });
 
+const exitLintRuleSync = createLinterRule({
+  name: "exit-lint-rule-sync",
+  description: "",
+  severity: "warning",
+  messages: {
+    default: "Exit lint rule sync called",
+  },
+  async: false,
+  create(context: any) {
+    return {
+      interface: (target) => {
+        context.lastInterface = target;
+      },
+      exit: () => {
+        context.reportDiagnostic({
+          target: context.lastInterface,
+          messageId: "default",
+        });
+      },
+    };
+  },
+});
+
+const noInterfaceFooAsync = createLinterRule({
+  name: "no-interface-foo2-async",
+  description: "",
+  severity: "warning",
+  messages: {
+    default: "Cannot call interface 'Foo2' (async rule)",
+  },
+  async: true,
+  create(
+    context: LinterRuleContext<{
+      readonly default: "Cannot call interface 'Foo2' (async rule)";
+    }> & { interfaceToCheck?: Interface[] },
+  ) {
+    return {
+      interface: (target) => {
+        if (!context.interfaceToCheck) {
+          context.interfaceToCheck = [];
+        }
+        context.interfaceToCheck.push(target);
+      },
+      exit: async () => {
+        const r = await new Promise<Interface[]>((resolve) => {
+          setTimeout(() => {
+            resolve(context.interfaceToCheck?.filter((t) => t.name === "Foo2") ?? []);
+          }, 0);
+        });
+        r.forEach((target) => {
+          context.reportDiagnostic({
+            target,
+          });
+        });
+      },
+    };
+  },
+});
+
 describe("compiler: linter", () => {
   async function createTestLinter(
     code: string | Record<string, string>,
     linterDef: LinterDefinition,
   ): Promise<Linter> {
-    const host = await createTestHost();
+    let result;
     if (typeof code === "string") {
-      host.addTypeSpecFile("main.tsp", code);
+      result = await Tester.compile(code);
     } else {
-      for (const [name, content] of Object.entries(code)) {
-        host.addTypeSpecFile(name, content);
-      }
+      const mainCode = code["main.tsp"];
+      const otherFiles = Object.fromEntries(
+        Object.entries(code).filter(([name]) => name !== "main.tsp"),
+      );
+      result =
+        Object.keys(otherFiles).length > 0
+          ? await Tester.files(otherFiles).compile(mainCode)
+          : await Tester.compile(mainCode);
     }
 
     const library: LibraryInstance = {
@@ -54,9 +120,7 @@ describe("compiler: linter", () => {
       linter: resolveLinterDefinition("@typespec/test-linter", linterDef),
     };
 
-    await host.compile("main.tsp");
-
-    const linter = createLinter(host.program, (libName) =>
+    const linter = createLinter(result.program, (libName) =>
       Promise.resolve(libName === "@typespec/test-linter" ? library : undefined),
     );
     return linter;
@@ -82,7 +146,14 @@ describe("compiler: linter", () => {
     const linter = await createTestLinter(`model Foo {}`, {
       rules: [noModelFoo],
     });
-    expectDiagnosticEmpty(linter.lint());
+    expectDiagnosticEmpty((await linter.lint()).diagnostics);
+  });
+
+  it("registering a rule doesn't enable it: async", async () => {
+    const linter = await createTestLinter(`interface Foo2 {}`, {
+      rules: [noInterfaceFooAsync],
+    });
+    expectDiagnosticEmpty((await linter.lint()).diagnostics);
   });
 
   it("enabling a rule that doesn't exists emit a diagnostic", async () => {
@@ -159,7 +230,7 @@ describe("compiler: linter", () => {
       const linter = await createTestLinterAndEnableRules(files, {
         rules: [noModelFoo],
       });
-      expectDiagnosticEmpty(linter.lint());
+      expectDiagnosticEmpty((await linter.lint()).diagnostics);
     });
 
     it("emit diagnostic when in the user code", async () => {
@@ -174,7 +245,7 @@ describe("compiler: linter", () => {
       const linter = await createTestLinterAndEnableRules(files, {
         rules: [noModelFoo],
       });
-      expectDiagnostics(linter.lint(), {
+      expectDiagnostics((await linter.lint()).diagnostics, {
         severity: "warning",
         code: "@typespec/test-linter/no-model-foo",
         message: `Cannot call model 'Foo'`,
@@ -192,10 +263,26 @@ describe("compiler: linter", () => {
           enable: { "@typespec/test-linter/no-model-foo": true },
         }),
       );
-      expectDiagnostics(linter.lint(), {
+      expectDiagnostics((await linter.lint()).diagnostics, {
         severity: "warning",
         code: "@typespec/test-linter/no-model-foo",
         message: `Cannot call model 'Foo'`,
+      });
+    });
+
+    it("emit a diagnostic if rule report one: async", async () => {
+      const linter = await createTestLinter(`interface Foo2 {}`, {
+        rules: [noInterfaceFooAsync],
+      });
+      expectDiagnosticEmpty(
+        await linter.extendRuleSet({
+          enable: { "@typespec/test-linter/no-interface-foo2-async": true },
+        }),
+      );
+      expectDiagnostics((await linter.lint()).diagnostics, {
+        severity: "warning",
+        code: "@typespec/test-linter/no-interface-foo2-async",
+        message: `Cannot call interface 'Foo2' (async rule)`,
       });
     });
 
@@ -208,7 +295,19 @@ describe("compiler: linter", () => {
           enable: { "@typespec/test-linter/no-model-foo": true },
         }),
       );
-      expectDiagnosticEmpty(linter.lint());
+      expectDiagnosticEmpty((await linter.lint()).diagnostics);
+    });
+
+    it("emit no diagnostic if rule report none: async", async () => {
+      const linter = await createTestLinter(`interface Foo3 {}`, {
+        rules: [noInterfaceFooAsync],
+      });
+      expectDiagnosticEmpty(
+        await linter.extendRuleSet({
+          enable: { "@typespec/test-linter/no-interface-foo2-async": true },
+        }),
+      );
+      expectDiagnosticEmpty((await linter.lint()).diagnostics);
     });
   });
 
@@ -222,7 +321,7 @@ describe("compiler: linter", () => {
           extends: ["@typespec/test-linter/all"],
         }),
       );
-      expectDiagnostics(linter.lint(), {
+      expectDiagnostics((await linter.lint()).diagnostics, {
         severity: "warning",
         code: "@typespec/test-linter/no-model-foo",
         message: `Cannot call model 'Foo'`,
@@ -242,7 +341,7 @@ describe("compiler: linter", () => {
           extends: ["@typespec/test-linter/custom"],
         }),
       );
-      expectDiagnostics(linter.lint(), {
+      expectDiagnostics((await linter.lint()).diagnostics, {
         severity: "warning",
         code: "@typespec/test-linter/no-model-foo",
         message: `Cannot call model 'Foo'`,
@@ -252,23 +351,20 @@ describe("compiler: linter", () => {
 
   describe("(integration) loading in program", () => {
     async function diagnoseReal(code: string) {
-      const host = await createTestHost();
-      host.addTypeSpecFile("main.tsp", code);
-      host.addTypeSpecFile(
-        "node_modules/my-lib/package.json",
-        JSON.stringify({ name: "my-lib", main: "index.js" }),
-      );
-      host.addJsFile("node_modules/my-lib/index.js", {
-        $lib: createTypeSpecLibrary({
-          name: "my-lib",
-          diagnostics: {},
+      return await Tester.files({
+        "node_modules/my-lib/package.json": JSON.stringify({ name: "my-lib", main: "index.js" }),
+        "node_modules/my-lib/index.js": mockFile.js({
+          $lib: createTypeSpecLibrary({
+            name: "my-lib",
+            diagnostics: {},
+          }),
+          $linter: { rules: [noModelFoo] },
         }),
-        $linter: { rules: [noModelFoo] },
-      });
-
-      return await host.diagnose("main.tsp", {
-        linterRuleSet: {
-          enable: { "my-lib/no-model-foo": true },
+      }).diagnose(code, {
+        compilerOptions: {
+          linterRuleSet: {
+            enable: { "my-lib/no-model-foo": true },
+          },
         },
       });
     }
@@ -286,6 +382,47 @@ describe("compiler: linter", () => {
       model Foo {}`);
 
       expectDiagnosticEmpty(diagnostics);
+    });
+  });
+
+  describe("async and sync rule together", () => {
+    it("runs both async and sync rules", async () => {
+      const linter = await createTestLinterAndEnableRules(
+        {
+          "main.tsp": `
+        model Foo {}
+        interface Foo2 {}
+      `,
+        },
+        {
+          rules: [noModelFoo, noInterfaceFooAsync, exitLintRuleSync],
+        },
+      );
+
+      const resultSync = await linter.lint();
+      expectDiagnostics(
+        resultSync.diagnostics,
+        [
+          {
+            severity: "warning",
+            code: "@typespec/test-linter/no-model-foo",
+            message: `Cannot call model 'Foo'`,
+          },
+          {
+            severity: "warning",
+            code: "@typespec/test-linter/exit-lint-rule-sync",
+            message: "Exit lint rule sync called",
+          },
+          {
+            severity: "warning",
+            code: "@typespec/test-linter/no-interface-foo2-async",
+            message: `Cannot call interface 'Foo2' (async rule)`,
+          },
+        ],
+        {
+          strict: true,
+        },
+      );
     });
   });
 });

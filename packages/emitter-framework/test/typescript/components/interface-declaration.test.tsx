@@ -1,14 +1,167 @@
-import { InterfaceDeclaration } from "../../../src/typescript/components/interface-declaration.js";
-
-import { For, List, Output, render } from "@alloy-js/core";
+import { getProgram } from "#test/utils.js";
+import { For, List } from "@alloy-js/core";
 import { SourceFile } from "@alloy-js/typescript";
-import { Namespace } from "@typespec/compiler";
-import { format } from "prettier";
-import { assert, describe, expect, it } from "vitest";
-import { getProgram } from "../test-host.js";
+import type { Namespace } from "@typespec/compiler";
+import { describe, expect, it } from "vitest";
+import { Output } from "../../../src/core/components/output.jsx";
+import { InterfaceDeclaration } from "../../../src/typescript/components/interface-declaration.js";
 
 describe("Typescript Interface", () => {
   describe("Interface bound to Typespec Types", () => {
+    it("declares an interface with multi line docs, explicit docs passed", async () => {
+      const program = await getProgram(`
+          namespace DemoService;
+
+          /**
+           * This is a test
+           * with multiple lines
+           */
+          model Foo {
+            knownProp: string;
+          }
+          `);
+
+      const [namespace] = program.resolveTypeReference("DemoService");
+      const models = Array.from((namespace as Namespace).models.values());
+
+      expect(
+        <Output program={program}>
+          <SourceFile path="test.ts">
+            <List hardline>
+              {models.map((model) => (
+                <InterfaceDeclaration
+                  export
+                  type={model}
+                  doc={["This is an overridden doc comment\nwith multiple lines"]}
+                />
+              ))}
+            </List>
+          </SourceFile>
+        </Output>,
+      ).toRenderTo(
+        `
+            /**
+             * This is an overridden doc comment
+             * with multiple lines
+             */
+            export interface Foo {
+              knownProp: string;
+            }
+            `,
+      );
+    });
+    it("declares an interface with multi line docs", async () => {
+      const program = await getProgram(`
+          namespace DemoService;
+
+          /**
+           * This is a test
+           * with multiple lines
+           */
+          model Foo {
+            knownProp: string;
+          }
+          `);
+
+      const [namespace] = program.resolveTypeReference("DemoService");
+      const models = Array.from((namespace as Namespace).models.values());
+
+      expect(
+        <Output program={program}>
+          <SourceFile path="test.ts">
+            <List hardline>
+              {models.map((model) => (
+                <InterfaceDeclaration export type={model} />
+              ))}
+            </List>
+          </SourceFile>
+        </Output>,
+      ).toRenderTo(
+        `
+            /**
+             * This is a test
+             * with multiple lines
+             */
+            export interface Foo {
+              knownProp: string;
+            }
+            `,
+      );
+    });
+    it("declares an interface with @doc", async () => {
+      const program = await getProgram(`
+          namespace DemoService;
+
+          @doc("This is a test")
+          model Foo {
+            knownProp: string;
+          }
+          `);
+
+      const [namespace] = program.resolveTypeReference("DemoService");
+      const models = Array.from((namespace as Namespace).models.values());
+
+      expect(
+        <Output program={program}>
+          <SourceFile path="test.ts">
+            <List hardline>
+              {models.map((model) => (
+                <InterfaceDeclaration export type={model} />
+              ))}
+            </List>
+          </SourceFile>
+        </Output>,
+      ).toRenderTo(
+        `
+            /**
+             * This is a test
+             */
+            export interface Foo {
+              knownProp: string;
+            }
+            `,
+      );
+    });
+    it("declares an interface with doc", async () => {
+      const program = await getProgram(`
+          namespace DemoService;
+
+          /**
+           * This is a test
+           */
+          model Foo {
+            @doc("This is a known property")
+            knownProp: string;
+          }
+          `);
+
+      const [namespace] = program.resolveTypeReference("DemoService");
+      const models = Array.from((namespace as Namespace).models.values());
+
+      expect(
+        <Output program={program}>
+          <SourceFile path="test.ts">
+            <List hardline>
+              {models.map((model) => (
+                <InterfaceDeclaration export type={model} />
+              ))}
+            </List>
+          </SourceFile>
+        </Output>,
+      ).toRenderTo(
+        `
+            /**
+             * This is a test
+             */
+            export interface Foo {
+              /**
+               * This is a known property
+               */
+              knownProp: string;
+            }
+            `,
+      );
+    });
     describe("Bound to Model", () => {
       it("creates an interface that extends a model for Record spread", async () => {
         const program = await getProgram(`
@@ -23,8 +176,8 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <List hardline>
                 {models.map((model) => (
@@ -33,25 +186,14 @@ describe("Typescript Interface", () => {
               </List>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `
+        ).toRenderTo(`
             export interface DifferentSpreadModelRecord {
               knownProp: string;
               additionalProperties?: Record<string, unknown>;
             }
-            `,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+            `);
       });
+
       it("creates an interface for a model that 'is' an array ", async () => {
         const program = await getProgram(`
           namespace DemoService;
@@ -62,28 +204,16 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = (namespace as Namespace).models;
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <For each={Array.from(models.values())} hardline>
                 {(model) => <InterfaceDeclaration export type={model} />}
               </For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface Foo extends Array<string> { }
-            `,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface Foo extends Array<string> {}`);
       });
 
       it("creates an interface for a model that 'is' a record ", async () => {
@@ -91,35 +221,23 @@ describe("Typescript Interface", () => {
           namespace DemoService;
 
           model Foo is Record<string>;
-          `);
+        `);
 
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = (namespace as Namespace).models;
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <For each={Array.from(models.values())} hardline>
                 {(model) => <InterfaceDeclaration export type={model} />}
               </For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface Foo {
-              additionalProperties?: Record<string, string>;
-            }
-            `,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface Foo {
+            additionalProperties?: Record<string, string>;
+          }`);
       });
 
       it("creates an interface of a model that spreads a Record", async () => {
@@ -134,31 +252,19 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = (namespace as Namespace).models;
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <For each={Array.from(models.values())} hardline>
                 {(model) => <InterfaceDeclaration export type={model} />}
               </For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `
+        ).toRenderTo(`
             export interface Foo {
               additionalProperties?: Record<string, string>;
             }
-            `,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+            `);
       });
 
       it("creates an interface that extends an spread model", async () => {
@@ -182,38 +288,26 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = (namespace as Namespace).models;
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <For each={Array.from(models.values())} hardline>
                 {(model) => <InterfaceDeclaration export type={model} />}
               </For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface ModelForRecord {
-              state: string;
-            }
-            export interface DifferentSpreadModelRecord {
-              knownProp: string;
-              additionalProperties?: Record<string, ModelForRecord>;
-            }
-            export interface DifferentSpreadModelDerived extends DifferentSpreadModelRecord {
-              derivedProp: ModelForRecord;
-              additionalProperties?: Record<string, ModelForRecord>;
-            }
-            `,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface ModelForRecord {
+            state: string;
+          }
+          export interface DifferentSpreadModelRecord {
+            knownProp: string;
+            additionalProperties?: Record<string, ModelForRecord>;
+          }
+          export interface DifferentSpreadModelDerived extends DifferentSpreadModelRecord {
+            derivedProp: ModelForRecord;
+            additionalProperties?: Record<string, ModelForRecord>;
+          }`);
       });
 
       it("creates an interface that has additional properties", async () => {
@@ -229,32 +323,21 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               {models.map((model) => (
                 <InterfaceDeclaration export type={model} />
               ))}
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface Widget {
+        ).toRenderTo(`
+          export interface Widget {
             id: string;
             weight: number;
             color: "blue" | "red";
             additionalProperties?: Record<string, unknown>;
-          }`,
-          {
-            parser: "typescript",
-          },
-        );
-
-        expect(actualContent).toBe(expectedContent);
+          }`);
       });
 
       it("handles a type reference to a union variant", async () => {
@@ -276,28 +359,18 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration type={models[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `interface Widget {
-              id: string;
-              weight: number;
-              color: "BLUE";
-            }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          interface Widget {
+            id: string;
+            weight: number;
+            color: "BLUE";
+          }`);
       });
       it("creates an interface", async () => {
         const program = await getProgram(`
@@ -313,28 +386,40 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration type={models[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `interface Widget {
+        ).toRenderTo(`
+          interface Widget {
             id: string;
             weight: number;
             color: "blue" | "red";
-          }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+          }`);
+      });
+
+      it("renders an empty interface with a never-typed member", async () => {
+        const program = await getProgram(`
+        namespace DemoService;
+    
+        model Widget{
+          property: never;
+        }
+        `);
+
+        const [namespace] = program.resolveTypeReference("DemoService");
+        const models = Array.from((namespace as Namespace).models.values());
+
+        expect(
+          <Output program={program}>
+            <SourceFile path="test.ts">
+              <InterfaceDeclaration export type={models[0]} />
+            </SourceFile>
+          </Output>,
+        ).toRenderTo(`
+          export interface Widget {}`);
       });
 
       it("can override interface name", async () => {
@@ -351,28 +436,18 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export name="MyOperations" type={models[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface MyOperations {
-          id: string;
-          weight: number;
-          color: "blue" | "red";
-         }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface MyOperations {
+            id: string;
+            weight: number;
+            color: "blue" | "red";
+          }`);
       });
 
       it("can add a members to the interface", async () => {
@@ -389,32 +464,26 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export name="MyOperations" type={models[0]}>
-                customProperty: string; customMethod(): void;
+                <hbr />
+                <List>
+                  <>customProperty: string;</>
+                  <>customMethod(): void;</>
+                </List>
               </InterfaceDeclaration>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface MyOperations {
-          id: string;
-          weight: number;
-          color: "blue" | "red";
-          customProperty: string;
-          customMethod(): void;
-        }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface MyOperations {
+            id: string;
+            weight: number;
+            color: "blue" | "red";
+            customProperty: string;
+            customMethod(): void;
+          }`);
       });
 
       it("interface name can be customized", async () => {
@@ -431,28 +500,18 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export name="MyModel" type={models[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface MyModel {
+        ).toRenderTo(`
+          export interface MyModel {
             id: string;
             weight: number;
             color: "blue" | "red";
-        }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+          }`);
       });
 
       it("interface with extends", async () => {
@@ -474,21 +533,14 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
-              {models.map((model) => (
-                <InterfaceDeclaration export type={model} />
-              ))}
+              <For each={models}>{(model) => <InterfaceDeclaration export type={model} />}</For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface Widget {
+        ).toRenderTo(`
+          export interface Widget {
             id: string;
             weight: number;
             color: "blue" | "red";
@@ -496,16 +548,11 @@ describe("Typescript Interface", () => {
           export interface ErrorWidget extends Widget {
             code: number;
             message: string;
-          }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+          }`);
       });
     });
 
-    describe.skip("Bound to Interface", () => {
+    describe("Bound to Interface", () => {
       it("creates an interface", async () => {
         const program = await getProgram(`
         namespace DemoService;
@@ -518,26 +565,16 @@ describe("Typescript Interface", () => {
         const [namespace] = program.resolveTypeReference("DemoService");
         const interfaces = Array.from((namespace as Namespace).interfaces.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export type={interfaces[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface WidgetOperations {
-          getName(id: string): string;
-        }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface WidgetOperations {
+            getName(id: string): string;
+          }`);
       });
 
       it("should handle spread and non spread model parameters", async () => {
@@ -558,40 +595,41 @@ describe("Typescript Interface", () => {
         const interfaces = Array.from((namespace as Namespace).interfaces.values());
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export type={interfaces[0]} />
+              <hbr />
               <InterfaceDeclaration export type={models[0]} />
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface WidgetOperations {
-          getName(foo: Foo): string;
-          getOtherName(name: string): string
-        }
-        export interface Foo {
-          name: string;
-        }  
-        `,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface WidgetOperations {
+            getName(foo: Foo): string;
+            getOtherName(name: string): string;
+          }
+          export interface Foo {
+            name: string;
+          }`);
       });
 
       it("creates an interface with Model references", async () => {
         const program = await getProgram(`
         namespace DemoService;
     
+        /**
+         * Operations for Widget
+         */
         interface WidgetOperations {
-          op getName(id: string): Widget;
+          /**
+           * Get the name of the widget
+           */
+          op getName(
+            /**
+             * The id of the widget
+             */
+             id: string
+          ): Widget;
         }
 
         model Widget {
@@ -605,34 +643,31 @@ describe("Typescript Interface", () => {
         const interfaces = Array.from((namespace as Namespace).interfaces.values());
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export type={interfaces[0]} />
-              {models.map((model) => (
-                <InterfaceDeclaration export type={model} />
-              ))}
+              <hbr />
+              <For each={models}>{(model) => <InterfaceDeclaration export type={model} />}</For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface WidgetOperations {
-          getName(id: string): Widget;
-        }
-        export interface Widget {
-          id: string;
-          weight: number;
-          color: "blue" | "red";
-        }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          /**
+           * Operations for Widget
+           */
+          export interface WidgetOperations {
+            /**
+             * Get the name of the widget
+             *
+             * @param {string} id - The id of the widget
+             */
+            getName(id: string): Widget;
+          }
+          export interface Widget {
+            id: string;
+            weight: number;
+            color: "blue" | "red";
+          }`);
       });
 
       it("creates an interface that extends another", async () => {
@@ -658,35 +693,24 @@ describe("Typescript Interface", () => {
         const interfaces = Array.from((namespace as Namespace).interfaces.values());
         const models = Array.from((namespace as Namespace).models.values());
 
-        const res = render(
-          <Output>
+        expect(
+          <Output program={program}>
             <SourceFile path="test.ts">
               <InterfaceDeclaration export type={interfaces[1]} />
-              {models.map((model) => (
-                <InterfaceDeclaration export type={model} />
-              ))}
+              <hbr />
+              <For each={models}>{(model) => <InterfaceDeclaration export type={model} />}</For>
             </SourceFile>
           </Output>,
-        );
-
-        const testFile = res.contents.find((file) => file.path === "test.ts");
-        assert(testFile, "test.ts file not rendered");
-        const actualContent = await format(testFile.contents as string, { parser: "typescript" });
-        const expectedContent = await format(
-          `export interface WidgetOperationsExtended {
-          getName(id: string): Widget;
-          delete(id: string): void;
-        }
-        export interface Widget {
-          id: string;
-          weight: number;
-          color: "blue" | "red";
-        }`,
-          {
-            parser: "typescript",
-          },
-        );
-        expect(actualContent).toBe(expectedContent);
+        ).toRenderTo(`
+          export interface WidgetOperationsExtended {
+            getName(id: string): Widget;
+            delete(id: string): void;
+          }
+          export interface Widget {
+            id: string;
+            weight: number;
+            color: "blue" | "red";
+          }`);
       });
     });
   });

@@ -1,11 +1,14 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using System;
+using System.Net;
+using System.Text.Json;
+using System.Threading.Tasks;
 using Microsoft.TypeSpec.Generator.Input;
 using Microsoft.TypeSpec.Generator.Primitives;
 using Microsoft.TypeSpec.Generator.Providers;
 using Microsoft.TypeSpec.Generator.Tests.Common;
-using Moq;
 using NUnit.Framework;
 
 namespace Microsoft.TypeSpec.Generator.Tests
@@ -21,11 +24,13 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void ExtensibleStringEnumType()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, isExtensible: true, usage: InputModelTypeUsage.Input, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
+            // Updated to use StringEnum with collection expression for values
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                isExtensible: true,
+                usage: InputModelTypeUsage.Input
+            );
             var expected = new CSharpType("SampleType", "Sample.Models", true, false, null, [], true, true, underlyingEnumType: typeof(string));
 
             var actual = CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(input);
@@ -37,11 +42,11 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void ExtensibleStringNullableEnumType()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, usage: InputModelTypeUsage.Input, isExtensible: true, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: true);
             var nullableInput = new InputNullableType(input);
             var expected = new CSharpType("SampleType", "Sample.Models", true, true, null, [], true, true, underlyingEnumType: typeof(string));
 
@@ -54,11 +59,11 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void ExtensibleStringEnumTypeProvider()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, usage: InputModelTypeUsage.Input, isExtensible: true, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: true);
             var expected = new CSharpType("SampleType", "Sample.Models", true, false, null, [], true, true, underlyingEnumType: typeof(string));
 
             var enumProvider = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
@@ -70,11 +75,12 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void FixedStringEnumType()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, usage: InputModelTypeUsage.Input, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
+            // Updated to use StringEnum with collection expression for values
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input
+            );
             var expected = new CSharpType("SampleType", "Sample.Models", true, false, null, [], true, false, underlyingEnumType: typeof(string));
 
             var actual = CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(input);
@@ -86,11 +92,10 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void CreateSameEnum()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, usage: InputModelTypeUsage.Input, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input);
             var expected = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
 
             var actual = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
@@ -101,18 +106,18 @@ namespace Microsoft.TypeSpec.Generator.Tests
         [Test]
         public void CreateEnum_WithDeclaringType()
         {
-            var input = InputFactory.Enum("sampleType", InputPrimitiveType.String, usage: InputModelTypeUsage.Input, values:
-            [
-                InputFactory.EnumMember.String("value1", "value1"),
-                InputFactory.EnumMember.String("value2", "value2")
-            ]);
-            var declaringType = new Mock<TypeProvider>().Object;
+            var input = InputFactory.StringEnum(
+                "sampleType",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input);
+            var declaringType = new TestTypeProvider();
+
             var expected = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input, declaringType);
             var actual = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input, declaringType);
             Assert.IsTrue(ReferenceEquals(expected, actual));
 
             // Validate that a new type is created when the declaring type is different
-            var declaringType2 = new Mock<TypeProvider>().Object;
+            var declaringType2 = new TestTypeProvider();
             var expected2 = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input, declaringType2);
             var actual2 = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input, declaringType2);
             Assert.IsTrue(ReferenceEquals(expected2, actual2));
@@ -145,6 +150,180 @@ namespace Microsoft.TypeSpec.Generator.Tests
             var input = new InputPrimitiveType(kind, name, $"TypeSpec.{name}", encode, null);
 
             Assert.AreEqual(encode == "string" ? SerializationFormat.Int_String : SerializationFormat.Default, CodeModelGenerator.Instance.TypeFactory.GetSerializationFormat(input));
+        }
+
+        [TestCase(typeof(Guid))]
+        [TestCase(typeof(IPAddress))]
+        [TestCase(typeof(BinaryData))]
+        [TestCase(typeof(Uri))]
+        [TestCase(typeof(JsonElement))]
+        public void CreatesFrameworkType(Type expectedType)
+        {
+            var factory = new TestTypeFactory();
+
+            var actual = factory.InvokeCreateFrameworkType(expectedType.FullName!);
+            Assert.AreEqual(expectedType, actual);
+        }
+
+        [TestCase("lowercase", "Lowercase")]
+        [TestCase("lowercase.namespace", "Lowercase.Namespace")]
+        [TestCase("lowercase.namespace.client", "Lowercase.Namespace.Client")]
+        [TestCase("PascalCase", "PascalCase")]
+        [TestCase("PascalCase.Namespace", "PascalCase.Namespace")]
+        [TestCase("camelCase", "CamelCase")]
+        [TestCase("camelCase.namespace", "CamelCase.Namespace")]
+        [TestCase("kebab-case", "KebabCase")]
+        [TestCase("kebab-case.namespace", "KebabCase.Namespace")]
+        [TestCase("snake_case", "SnakeCase")]
+        [TestCase("snake_case.namespace", "SnakeCase.Namespace")]
+        [TestCase("mixed_case-namespace.example", "MixedCaseNamespace.Example")]
+        [TestCase("number123", "Number123")]
+        [TestCase("number123.namespace", "Number123.Namespace")]
+        [TestCase("UPPERCASE", "UPPERCASE")]
+        [TestCase("UPPERCASE.NAMESPACE", "UPPERCASE.NAMESPACE")]
+        [TestCase("type.union", "_Type.Union")]
+        [TestCase("type.array", "_Type._Array")]
+        [TestCase("array.foo", "_Array.Foo")]
+        [TestCase("enum.bar", "_Enum.Bar")]
+        [TestCase("Type.Union", "_Type.Union")]
+        [TestCase("Array.Foo", "_Array.Foo")]
+        [TestCase("Enum.Bar", "_Enum.Bar")]
+        public void GetCleanNameSpace_ConvertsToPascalCase(string input, string expected)
+        {
+            var actual = CodeModelGenerator.Instance.TypeFactory.GetCleanNameSpace(input);
+            Assert.AreEqual(expected, actual);
+        }
+
+        [Test]
+        public async Task CreateEnum_WithVisitor_ChangesNamespaceToModels()
+        {
+            // Arrange - Create a fixed enum
+            var input = InputFactory.StringEnum(
+                "TestEnum",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: false);
+
+            await MockHelpers.LoadMockGeneratorAsync(inputEnumTypes: [input]);
+
+            // Create a visitor that modifies the namespace
+            var visitor = new NamespaceModifyingVisitor();
+            CodeModelGenerator.Instance.AddVisitor(visitor);
+
+            var enumProvider = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
+
+            Assert.IsNotNull(enumProvider);
+            Assert.IsTrue(enumProvider!.Type.Namespace.EndsWith(".SomeOtherNamespace"));
+            Assert.IsTrue(enumProvider is FixedEnumProvider);
+            Assert.IsNotNull(enumProvider.ExtensibleEnumView);
+            Assert.IsNull(enumProvider.CustomCodeView);
+        }
+
+        [Test]
+        public async Task CreateEnum_WithCustomCodeAsExtensible_ReturnsExtensibleEnum()
+        {
+            // Arrange - Create a fixed enum in input
+            var inputEnum = InputFactory.StringEnum(
+                "CustomizedEnum",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: false);
+
+            // Load compilation with custom code that changes the enum to extensible (struct)
+            await MockHelpers.LoadMockGeneratorAsync(
+                inputEnumTypes: [inputEnum],
+                compilation: async () => await Helpers.GetCompilationFromDirectoryAsync());
+
+            // Create a visitor that modifies the namespace
+            var visitor = new NamespaceModifyingVisitor();
+            CodeModelGenerator.Instance.AddVisitor(visitor);
+
+            var result = CodeModelGenerator.Instance.TypeFactory.CreateEnum(inputEnum);
+
+            Assert.IsNotNull(result);
+            Assert.IsInstanceOf<ExtensibleEnumProvider>(result);
+            Assert.IsTrue(result!.Type.Namespace.EndsWith(".SomeOtherNamespace"));
+        }
+
+        [Test]
+        public void CreateEnum_FixedEnumWithoutVisitorsOrCustomCode_ReturnsFixedEnum()
+        {
+            // Arrange - Create a fixed enum
+            var input = InputFactory.StringEnum(
+                "PlainFixedEnum",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: false);
+
+            // Act - Create enum without any visitors or custom code modifications
+            var enumProvider = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
+
+            // Assert
+            Assert.IsNotNull(enumProvider);
+            Assert.IsInstanceOf<FixedEnumProvider>(enumProvider);
+            Assert.IsFalse(enumProvider!.IsExtensible);
+        }
+
+        [Test]
+        public void CreateEnum_ExtensibleEnumWithoutVisitorsOrCustomCode_ReturnsExtensibleEnum()
+        {
+            // Arrange - Create an extensible enum
+            var input = InputFactory.StringEnum(
+                "PlainExtensibleEnum",
+                [("value1", "value1"), ("value2", "value2")],
+                usage: InputModelTypeUsage.Input,
+                isExtensible: true);
+
+            // Act - Create enum without any visitors or custom code modifications
+            var enumProvider = CodeModelGenerator.Instance.TypeFactory.CreateEnum(input);
+
+            // Assert
+            Assert.IsNotNull(enumProvider);
+            Assert.IsInstanceOf<ExtensibleEnumProvider>(enumProvider);
+            Assert.IsTrue(enumProvider!.IsExtensible);
+        }
+
+        [Test]
+        public void CreateCSharpType_SelfReferencingModel_DoesNotThrow()
+        {
+            var selfRefModel = InputFactory.Model("QueryFilter");
+            var isReentrant = false;
+
+            MockHelpers.LoadMockGenerator(createCSharpTypeCore: (InputType inputType) =>
+            {
+                if (inputType == selfRefModel && !isReentrant)
+                {
+                    isReentrant = true;
+                    // Simulate the re-entrant call that occurs with self-referencing models
+                    // (e.g., QueryFilter with property and: QueryFilter[]).
+                    // CreateCSharpTypeCore -> CreateModel -> BuildProperties -> CreateCSharpType(same model)
+                    CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(selfRefModel);
+                }
+                return typeof(object);
+            });
+
+            // Before the fix, this would throw ArgumentException:
+            // "An item with the same key has already been added"
+            Assert.DoesNotThrow(() => CodeModelGenerator.Instance.TypeFactory.CreateCSharpType(selfRefModel));
+        }
+
+        /// <summary>
+        /// Test visitor that modifies enum namespaces to end with ".Models"
+        /// </summary>
+        private class NamespaceModifyingVisitor : LibraryVisitor
+        {
+            protected internal override EnumProvider? PreVisitEnum(InputEnumType enumType, EnumProvider? type)
+            {
+                if (type == null)
+                    return type;
+
+                // Create a new enum provider with modified namespace
+                // replace ".Models" with ".SomeOtherNamespace"
+                var updatedNamespace = type.Type.Namespace.Replace(".Models", ".SomeOtherNamespace");
+                type.Update(@namespace: updatedNamespace);
+
+                return type;
+            }
         }
     }
 }
