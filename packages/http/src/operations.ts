@@ -15,7 +15,7 @@ import {
 import { getAuthenticationForOperation } from "./auth.js";
 import { getAuthentication } from "./decorators.js";
 import { isSharedRoute } from "./decorators/shared-route.js";
-import { createDiagnostic, reportDiagnostic } from "./lib.js";
+import { createDiagnostic, HttpStateKeys, reportDiagnostic } from "./lib.js";
 import { getResponsesForOperation } from "./responses.js";
 import { resolvePathAndParameters } from "./route.js";
 import {
@@ -25,6 +25,11 @@ import {
   OperationContainer,
   RouteResolutionOptions,
 } from "./types.js";
+
+interface CachedHttpOperation {
+  httpOperation: HttpOperation;
+  diagnostics: readonly Diagnostic[];
+}
 
 /**
  * Return the Http Operation details for a given TypeSpec operation.
@@ -36,6 +41,28 @@ export function getHttpOperation(
   operation: Operation,
   options?: RouteResolutionOptions,
 ): [HttpOperation, readonly Diagnostic[]] {
+  // Use the program-level cache so that multiple callers (validators, linter
+  // rules, emitters) share resolved HTTP operation data without recomputation.
+  // Only use cache when:
+  // - No custom options are provided (options like routeParamFilter can produce
+  //   different results for the same operation)
+  // - The operation has finished checking (isFinished !== false), because
+  //   decorators may call getHttpOperation before all decorators are applied,
+  //   and the result would be incomplete
+  const useCache = !options && operation.isFinished !== false;
+  if (useCache) {
+    const cache = program.stateMap(HttpStateKeys.httpOperationCache) as Map<
+      Operation,
+      CachedHttpOperation
+    >;
+    const existing = cache.get(operation);
+    if (existing) {
+      return [existing.httpOperation, existing.diagnostics];
+    }
+    const result = getHttpOperationInternal(program, operation, options, new Map());
+    cache.set(operation, { httpOperation: result[0], diagnostics: result[1] });
+    return result;
+  }
   return getHttpOperationInternal(program, operation, options, new Map());
 }
 
@@ -53,10 +80,26 @@ export function listHttpOperationsIn(
 ): [HttpOperation[], readonly Diagnostic[]] {
   const diagnostics = createDiagnosticCollector();
   const operations = listOperationsIn(container, options?.listOptions);
-  const cache = new Map();
-  const httpOperations = operations.map((x) =>
-    diagnostics.pipe(getHttpOperationInternal(program, x, options, cache)),
-  );
+  const useCache = !options;
+  const programCache = useCache
+    ? (program.stateMap(HttpStateKeys.httpOperationCache) as Map<Operation, CachedHttpOperation>)
+    : undefined;
+  // Local cache shared across operations in this call for overload resolution
+  const localCache = new Map<Operation, HttpOperation>();
+  const httpOperations = operations.map((x) => {
+    // Only use program cache for operations that have finished checking
+    if (programCache && x.isFinished !== false) {
+      const existing = programCache.get(x);
+      if (existing) {
+        return diagnostics.pipe([existing.httpOperation, existing.diagnostics] as const);
+      }
+    }
+    const result = getHttpOperationInternal(program, x, options, localCache);
+    if (programCache && x.isFinished !== false) {
+      programCache.set(x, { httpOperation: result[0], diagnostics: result[1] });
+    }
+    return diagnostics.pipe(result);
+  });
   return diagnostics.wrap(httpOperations);
 }
 

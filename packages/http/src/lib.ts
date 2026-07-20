@@ -253,6 +253,7 @@ export const $lib = createTypeSpecLibrary({
     mergePatchPropertyOptions: {
       description: "Override options for a property in a merge patch transform",
     },
+    httpOperationCache: { description: "Cache for resolved HTTP operations" },
   },
 });
 
