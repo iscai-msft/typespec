@@ -1,5 +1,4 @@
 import { join, resolve } from "path";
-import "source-map-support/register.js";
 import yargs from "yargs";
 import { checkCoverage } from "../actions/check-coverage.js";
 import { generateScenarioSummary } from "../actions/generate-scenario-summary.js";
@@ -11,6 +10,8 @@ import { uploadScenarioManifest } from "../actions/upload-scenario-manifest.js";
 import { validateMockApis } from "../actions/validate-mock-apis.js";
 import { logger } from "../logger.js";
 import { getCommit } from "../utils/misc-utils.js";
+
+process.setSourceMapsEnabled(true);
 
 export const DEFAULT_PORT = 3000;
 
@@ -273,20 +274,13 @@ async function main() {
       },
     )
     .command(
-      "upload-manifest <scenariosPaths..>",
+      "upload-manifest <scenariosPath>",
       "Upload the scenario manifest. DO NOT CALL in generator.",
       (cmd) => {
         return cmd
-          .positional("scenariosPaths", {
+          .positional("scenariosPath", {
             description: "Path to the scenarios and mock apis",
             type: "string",
-            array: true,
-            demandOption: true,
-          })
-          .option("setName", {
-            type: "string",
-            description: "Set used to generate the manifest.",
-            array: true,
             demandOption: true,
           })
           .option("storageAccountName", {
@@ -298,14 +292,26 @@ async function main() {
             description: "Name of the Container",
             demandOption: true,
           })
+          .option("manifestName", {
+            type: "string",
+            description:
+              "Name of the manifest(will be located at manifests/<manifestName>.json in the container).",
+            demandOption: true,
+          })
+          .option("override", {
+            type: "boolean",
+            description: "Override existing manifest with the same version.",
+            default: false,
+          })
           .demandOption("storageAccountName");
       },
       async (args) => {
         await uploadScenarioManifest({
-          scenariosPaths: args.scenariosPaths,
+          scenariosPath: args.scenariosPath,
           storageAccountName: args.storageAccountName,
-          setNames: args.setName,
           containerName: args.containerName,
+          manifestName: args.manifestName,
+          override: args.override,
         });
       },
     )
