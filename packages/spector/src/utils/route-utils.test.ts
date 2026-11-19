@@ -3,7 +3,20 @@ import {
   getServerPathPrefixSegmentCount,
   isMockApiUriConsistentWithRoute,
   normalizeMockApiUri,
+  toExactExpressRoutePath,
 } from "./route-utils.js";
+
+describe("toExactExpressRoutePath", () => {
+  it("escapes express route tokens", () => {
+    expect(toExactExpressRoutePath("/translations:start/*rest/{opt}")).toBe(
+      "/translations\\:start/\\*rest/\\{opt\\}",
+    );
+  });
+
+  it("does not double escape already escaped colons", () => {
+    expect(toExactExpressRoutePath("/users/:id\\:export")).toBe("/users/\\:id\\:export");
+  });
+});
 
 describe("normalizeMockApiUri", () => {
   it("drops the query string", () => {

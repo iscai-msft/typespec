@@ -29,6 +29,14 @@ export function normalizeMockApiUri(uri: string): string {
 }
 
 /**
+ * Convert a mock API `uri` into an express route path that only matches the `uri` text exactly,
+ * i.e. with every express route token (`:param`, `*wildcard`, `{}` groups, ...) taken literally.
+ */
+export function toExactExpressRoutePath(uri: string): string {
+  return uri.replace(/\\(.)/g, "$1").replace(/[{}()[\]+?!:*\\]/g, "\\$&");
+}
+
+/**
  * Split a route/uri into path segments on `/`, ignoring any `/` that appears inside a URI template
  * expression (e.g. the `/` in `record{/param}`).
  */
