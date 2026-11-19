@@ -18,7 +18,7 @@ import { internalRouter } from "../routes/index.js";
 import { loadScenarioMockApis } from "../scenarios-resolver.js";
 import { MockApiServer } from "../server/index.js";
 import { parseJsonLines } from "../utils/body-utils.js";
-import { toExactExpressRoutePath } from "../utils/route-utils.js";
+import { toExpressRoutePath } from "../utils/route-utils.js";
 import type { ApiMockAppConfig } from "./config.js";
 import { processRequest } from "./request-processor.js";
 
@@ -56,20 +56,10 @@ export class MockApiApp {
 
     this.coverageTracker.setScenarios(ScenariosAndScenariosMetadata);
 
-    const routes: MockApiRoute[] = [];
     for (const { scenarios } of ScenariosAndScenariosMetadata) {
       for (const [name, scenario] of Object.entries(scenarios)) {
-        routes.push(...this.createScenarioRoutes(name, scenario));
+        this.registerScenario(name, scenario);
       }
-    }
-    // Register every exact `uri` before any `uri` pattern so a request for a declared `uri` is not
-    // captured by another endpoint whose `uri` express reads as a pattern (e.g. `:start` in
-    // `/translations:start` is a parameter that also matches `/translations:start-with-path`).
-    for (const { endpoint, handler } of routes) {
-      this.router.route(toExactExpressRoutePath(endpoint.uri))[endpoint.method](handler);
-    }
-    for (const { endpoint, handler } of routes) {
-      this.router.route(endpoint.uri)[endpoint.method](handler);
     }
 
     this.router.get("/.coverage", (req, res) => {
@@ -84,12 +74,15 @@ export class MockApiApp {
     };
   }
 
-  private createScenarioRoutes(name: string, scenario: ScenarioMockApi): MockApiRoute[] {
-    return scenario.apis.map((endpoint) => {
+  private registerScenario(name: string, scenario: ScenarioMockApi) {
+    for (const endpoint of scenario.apis) {
       if (!endpoint.handler) {
         endpoint.handler = createHandler(endpoint, this.resolverConfig);
       }
-      const handler = (req: RequestExt, res: Response) => {
+      const route = this.router.route(
+        toExpressRoutePath(endpoint.uri, endpoint.request?.pathParams),
+      );
+      route[endpoint.method]((req: RequestExt, res: Response) => {
         processRequest(
           this.coverageTracker,
           name,
@@ -102,15 +95,9 @@ export class MockApiApp {
           logger.error("Unexpected request error", e);
           res.status(500).end();
         });
-      };
-      return { endpoint, handler };
-    });
+      });
+    }
   }
-}
-
-interface MockApiRoute {
-  endpoint: MockApiDefinition;
-  handler: (req: RequestExt, res: Response) => void;
 }
 
 function validateBody(

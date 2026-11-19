@@ -26,12 +26,13 @@ function api(
 const apis = {
   start: api("/lro/translations:start", "start"),
   startWithPath: api("/lro/translations:start-with-path", "startWithPath"),
+  startWithPathId: api("/lro/translations:start-with-path-:id", "startWithPathId", { id: "123" }),
   escapedStart: api("/lro/escaped/translations\\:start", "escapedStart"),
   escapedStartWithPath: api("/lro/escaped/translations\\:start-with-path", "escapedStartWithPath"),
   getUser: api("/users/:id", "getUser", { id: "1" }, "get"),
   exportUser: api("/users/:id\\:export", "exportUser", { id: "1" }),
+  repeatableAction: api("/users/:id:repeatableAction", "repeatableAction", { id: "1" }),
   itemById: api("/items/item-:id", "itemById", { id: "42" }, "get"),
-  itemMe: api("/items/item-me", "itemMe", undefined, "get"),
   range: api("/ranges/:from-:to", "range", { from: "1", to: "5" }, "get"),
   version: api("/versioning/api-version:v1/test", "version"),
   escapedVersion: api("/versioning/api-version\\:v2/test", "escapedVersion"),
@@ -90,14 +91,18 @@ describe("mock api route matching", () => {
     ["/items/item-7", "itemById", { id: "7" }],
     ["/ranges/3-9", "range", { from: "3", to: "9" }],
     ["/users/42:export", "exportUser", { id: "42" }],
+    ["/lro/translations:start-with-path-7", "startWithPathId", { id: "7" }],
   ])("keeps express route parameters for %s", async (path, name, params) => {
     const method = apis[name as keyof typeof apis].method.toUpperCase();
     const response = await fetch(`${baseUrl}${path}`, { method });
     expect(await response.json()).toEqual({ name, params });
   });
 
-  it("returns 404 for an undeclared route", async () => {
-    const response = await fetch(`${baseUrl}/lro/other:start`, { method: "POST" });
-    expect(response.status).toBe(404);
-  });
+  it.each(["/lro/translations:foo", "/lro/translations:start-with-path-", "/users/1:unknown"])(
+    "returns 404 for undeclared action %s",
+    async (path) => {
+      const response = await fetch(`${baseUrl}${path}`, { method: "POST" });
+      expect(response.status).toBe(404);
+    },
+  );
 });

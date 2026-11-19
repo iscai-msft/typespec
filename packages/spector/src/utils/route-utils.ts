@@ -29,11 +29,18 @@ export function normalizeMockApiUri(uri: string): string {
 }
 
 /**
- * Convert a mock API `uri` into an express route path that only matches the `uri` text exactly,
- * i.e. with every express route token (`:param`, `*wildcard`, `{}` groups, ...) taken literally.
+ * Convert a mock API `uri` into an express route path.
+ *
+ * A `:name` declares a route parameter when it starts a path segment (e.g. `/users/:id`) or when
+ * `name` is declared in the mock API `request.pathParams` (e.g. `/items/item-:id`). Any other `:`
+ * is literal (e.g. `/translations:start`, `api-version:v1`) and is escaped so express does not read
+ * it as a parameter that also matches other paths (e.g. `/translations:start-with-path`).
  */
-export function toExactExpressRoutePath(uri: string): string {
-  return uri.replace(/\\(.)/g, "$1").replace(/[{}()[\]+?!:*\\]/g, "\\$&");
+export function toExpressRoutePath(uri: string, pathParams?: Record<string, unknown>): string {
+  return uri.replace(
+    /(?<=[^/\\]):([$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*)/gu,
+    (match, name: string) => (pathParams && Object.hasOwn(pathParams, name) ? match : `\\${match}`),
+  );
 }
 
 /**
